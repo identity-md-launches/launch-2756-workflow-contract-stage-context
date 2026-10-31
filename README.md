@@ -117,12 +117,31 @@ Rules as implemented, with the constants in `HamsterNapHook`:
 5. **Claim.** `settleNaps(maxPages)` may be called by anyone. It reads `state()` for the certified
    frontier and `roundPage` 16 rounds at a time from the last scanned round, pays every nap found
    in order, and keeps its position between calls, so a long gap can be worked through in several
-   transactions. A nap whose third round is not yet certified waits.
+   transactions. A nap whose third round is not yet certified waits. When the core cannot be
+   read (`state()` or `roundPage` reverts, has no code, or no longer decodes) the call reverts
+   with `CoreUnreadable` and keeps nothing.
 6. **Winners that cannot receive ETH** are credited in `owed` and pull with `withdrawOwed()`.
-   The game never blocks on a payout. `owed` also holds partial-fill fee refunds (rule 1).
+   The game never blocks on a payout: the payout call gives the winner's wallet a bounded
+   `PAYOUT_GAS` = 100,000 gas (plus the EVM's 2,300 for a value transfer) and copies none of its
+   return data, so a wallet that reverts, burns gas or answers with a payload sized to its gas
+   (an EOA carrying EIP-7702 code can do all three) only fails its own payout and is credited.
+   `withdrawOwed()` forwards all gas, so a wallet that needs more than the stipend collects
+   there. `owed` also holds partial-fill fee refunds (rule 1).
 7. **Failsafe.** When the core's `settledThroughRound` has stood still for `FAILSAFE_DELAY` =
-   7 days, `failsafe()` sends the whole pot to the last qualifying buyer. Anyone may trigger it;
-   only that buyer is paid. The hook sees the frontier only when it reads the core (every buy,
+   7 days, `failsafe()` pays the pot to the failsafe winner: the last qualifying buyer whose buy
+   happened before the failsafe opened (`failsafeOpensAt()` as known at the call). Anyone may
+   trigger it; only that buyer is paid. A buy at or after that moment pays its fee into the pot
+   but cannot take the failsafe position, so the pot cannot be sniped with a 0.001 ETH buy
+   placed ahead of the failsafe call; it still counts as a normal buy for the next nap if the
+   core turns out to be alive. `failsafeWinner()` shows who that is and what the pot holds.
+   Before paying, the failsafe settles every nap the core certified before it stalled, through
+   `lastSeenFrontier`, each to its own winner, so a nap that nobody claimed during the stall is
+   not swept into the failsafe: it scans up to `FAILSAFE_SCAN_PAGES` = 8 pages (128 rounds, about
+   21 hours) itself and reverts with `NapsUnsettled(scanRound, frontier)` when more is pending,
+   in which case `settleNaps` must catch up first. When the core's pages cannot be read at all
+   (a reverting, codeless or re-ABI'd core), nothing in the backlog can be certified and the
+   whole pot goes to the failsafe winner.
+   The hook sees the frontier only when it reads the core (every buy,
    every claim call and the failsafe itself), so it dates staleness conservatively from
    `frontierSeenAt`, the moment it last saw the frontier advance, or from the frontier round's end
    if that is later: `failsafeOpensAt()` = max(`roundEnd(lastSeenFrontier)`, `frontierSeenAt`) +
@@ -140,6 +159,12 @@ Rules as implemented, with the constants in `HamsterNapHook`:
 Events: `Buy` for every recorded buy (with the executed gross, the fee and `qualifying`),
 `NapSettled`, `FailsafeTaken`, `PayoutDeferred`, `FeeRefunded`, `OwedWithdrawn`,
 `ClaimsRedeemed`, `FrontierSeen`, `GameStarted`, `PoolBound`.
+
+Views for the website: `pot()`, `latestBuyer()`, `buyCount()` / `buyAt(i)` (round, timestamp,
+fees through it, latest buyer then), `winnerBefore(napStart)`, `failsafeWinner()`,
+`failsafeOpensAt()`, `scanRound()`, `zeroRun()`, `lastSeenFrontier()`, `owed(wallet)`.
+`decodeRoundPage(bytes)` is a pure helper the hook calls on itself to read the core's pages
+tolerantly; it has no state and nothing to protect.
 
 ### Where the ETH goes
 
@@ -170,7 +195,7 @@ not follow; the failsafe is the exit.
 
 ## Tests
 
-`forge test` runs 67 tests in five suites (the verifier re-runs them with
+`forge test` runs 76 tests in five suites (the verifier re-runs them with
 `FOUNDRY_FUZZ_SEED=0xfbaf61498d090e9328f47570cd503c9b9f7a6967092682129c4f05d58ca2d30c`):
 
 - `test/HamsterNapHook.t.sol`: permissions, callback access, initialization from the factory
@@ -185,9 +210,18 @@ not follow; the failsafe is the exit.
   long nap paying once, buys during a nap, several naps in one call, pagination, a nap with no
   qualifying buyer; the failsafe (closed, open, shut again when a buy or the failsafe call itself
   sees the frontier advance after eight idle days, dated from the game's start with a core that
-  was never readable, with a reverting core, without a buyer); a reverting, codeless or paused
-  core with sells and buys still working; a winner contract that rejects ETH and later withdraws;
-  a re-entrant winner; and a fuzzed ETH accounting run (pot = fees in − payouts) over mixed buys,
+  was never readable, with a reverting core, without a buyer; a certified but unclaimed nap paid
+  to its own winner before the failsafe pays the rest; `NapsUnsettled` over a 22-page backlog
+  until `settleNaps` catches up; the whole pot when the backlog cannot be read from a reverting
+  or codeless core; a buy at the moment the failsafe opens, or later, not taking the pot while a
+  buy one second earlier does; such a late buy still counting for a later nap when the core
+  proves alive); a reverting, codeless, paused or re-ABI'd core with sells and buys still
+  working and claims reverting with `CoreUnreadable`; a winner contract that rejects ETH and
+  later withdraws; a winner wallet that answers the payout with a gas-sized revert or return
+  payload (the EIP-7702 return bomb) at 30M gas, credited and not blocking the next nap or the
+  failsafe, then collecting through `withdrawOwed`; the payout gas bound (an ordinary wallet gets
+  the whole stipend and never more, a wallet that needs 150k gas is credited); a re-entrant
+  winner; and a fuzzed ETH accounting run (pot = fees in − payouts) over mixed buys,
   exact-output buys and sells.
 - `test/HamsterNapHook.claims.t.sol`: a fresh PoolManager whose pool was seeded with tokens only:
   the first buy's fee becomes an ERC-6909 claim, later fees come as ETH, claims are redeemed by
@@ -242,15 +276,37 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
   to the wallet could fail or re-enter, and a credit never blocks the swap. The buyer settles the
   full reservation with the PoolManager and pulls the difference with `withdrawOwed()`. The
   website should show a wallet's `owed` balance next to the buy panel.
-- The failsafe is callable by anyone but pays only the last qualifying buyer. "Not advanced for 7
-  days" is dated from the hook's last sighting of an advance (`frontierSeenAt`), or from the
-  frontier round's end if later. The sighting is an upper bound on when the core really settled
-  that round, so the failsafe can open late but never early. Between interactions the hook sees
-  nothing, so a core that advanced while nobody traded is noticed, and the clock restarted, by
-  the very call that tries the failsafe.
+- The failsafe is callable by anyone but pays only the last qualifying buyer before it opened.
+  "Not advanced for 7 days" is dated from the hook's last sighting of an advance
+  (`frontierSeenAt`), or from the frontier round's end if later. The sighting is an upper bound
+  on when the core really settled that round, so the failsafe can open late but never early.
+  Between interactions the hook sees nothing, so a core that advanced while nobody traded is
+  noticed, and the clock restarted, by the very call that tries the failsafe. The brief's rule 5
+  says only "the last qualifying buyer can take the pot"; reading it as the last buyer *when
+  the failsafe opened* (rather than at the moment of the call) is our choice: the alternative
+  made the failsafe a race that any 0.001 ETH buy in front of the real buyer's transaction
+  would win. Fees from buys after the opening go to that winner too; leaving them in the pot
+  would strand them if the core never returns.
+- The failsafe pays what certified naps leave, never a certified nap's own pot: a nap the core
+  certified before stalling (its three rounds inside `lastSeenFrontier`) belongs to the last
+  buyer before it under rule 4, whoever bought later. Beyond 8 unscanned pages the failsafe
+  asks for `settleNaps` first instead of scanning without bound in one transaction.
 - The hook accepts ETH only from the PoolManager, so stray transfers cannot muddle the pot.
-- Payouts forward all gas with a reentrancy lock and state updated before the call; a failing
-  payout is credited, never retried automatically.
+- Payouts give the winner's wallet 100,000 gas, copy no return data, run under a reentrancy
+  lock with state updated before the call, and credit a failing payout instead of retrying it.
+  Forwarding all gas and copying the return data (what a plain `call{value}` does) let a
+  winner's EIP-7702 code answer with a payload the hook could not afford to copy, freezing every
+  later nap behind it; the bounded, copy-free call cannot be made to fail from the callee's side.
+- The partial-fill refund of an exact-input buy (rule 1) is credited to `tx.origin`, the brief's
+  buyer, not to the router or smart account that settled the ETH with the PoolManager. v4 lets
+  `afterSwap` return value only in the unspecified currency (NAP on a buy), so the unused ETH
+  reservation cannot be handed back inside the swap; crediting the router would strand it in
+  most routers. For a relayed or ERC-4337 buy the relaying EOA therefore holds the credit, as it
+  holds the latest-buyer position; the amount is at most 2% of the unfilled input. Buyers who
+  trade through a relayer should use exact-output orders or a limit that fills.
+- Both fee formulas round down: a buy below 50 wei pays no fee and is not recorded, and every
+  buy underpays by less than 1 wei. The leak is sub-wei per swap and a sub-50-wei buy cannot
+  qualify, so this is intended, not corrected.
 - The Sworn check reverts a buy when the registry call fails on mainnet; sells are unaffected.
   On Sepolia, this launch, the check never runs.
 
@@ -261,8 +317,12 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
   idle, `failsafe()` after seven stale days. The website should offer the first two as buttons.
 - **Gas for claims.** A page costs one `roundPage` call of up to 16 records; `settleNaps(10)`
   covers about a day. After a long idle stretch call it repeatedly; progress is kept.
-- **Winner that cannot receive ETH.** A contract wallet without a payable fallback is credited
-  in `owed` and must call `withdrawOwed()` itself.
+- **Winner that cannot receive ETH.** A contract wallet without a payable fallback, or one whose
+  receive needs more than 100,000 gas, is credited in `owed` and must call `withdrawOwed()`
+  itself. The website should show a wallet's `owed` balance with a withdraw button.
+- **Failsafe with a backlog.** If `failsafe()` reverts with `NapsUnsettled`, call
+  `settleNaps(maxPages)` until `scanRound` passes `lastSeenFrontier`, then call it again. The
+  website's Claim button covers the first step; `failsafeWinner()` shows who the failsafe pays.
 - **Partial-fill refunds.** A buyer whose exact-input buy stopped at a price limit has the unused
   fee reservation in `owed` and pulls it with `withdrawOwed()`; it never expires.
 - **Dependency risk.** If SqueekCore pauses or breaks, buys and sells keep working, claims revert
@@ -276,3 +336,20 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
 Nothing to set: the hook has no owner-settable values. All outside addresses the brief gives
 (the SqueekCore proxy, the Sworn registry) are constants, and the PoolManager and factory come
 from the launch as `$poolManager` and `$factory`.
+
+## Changes in the review revision
+
+The independent review reopened the first accepted version with two reproducible defects, both
+fixed here with regression tests (`.imd-responses.json` answers each finding):
+
+- A winner's wallet answering the payout with a gas-sized payload made `settleNaps` and
+  `failsafe` run out of memory gas at any gas limit, freezing every later nap. Payouts now use
+  a bounded, copy-free call (`PAYOUT_GAS`), credit on failure, and the review's proof passes.
+- `failsafe` paid the whole pot, a certified but unclaimed nap's share included, to whoever
+  bought last. It now settles certified naps through `lastSeenFrontier` first (or asks for
+  `settleNaps` beyond 8 pages, or proceeds when the core's pages cannot be read) and pays only
+  what is left.
+- Advisory, also changed: the failsafe winner is fixed at the moment the failsafe opened
+  (`BuyRecord.time`, `failsafeWinner()`), closing a 0.001 ETH buy-and-call race for the pot.
+- Advisory, documented and kept: the partial-fill refund goes to `tx.origin`, and fees round
+  down (see Assumptions).

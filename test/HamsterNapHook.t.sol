@@ -14,6 +14,8 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {BaseHook} from "../src/base/BaseHook.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {RejectingWinner} from "./mocks/RejectingWinner.sol";
+import {ReturnBombWinner} from "./mocks/ReturnBombWinner.sol";
+import {ISqueekCore} from "../src/interfaces/ISqueekCore.sol";
 
 contract HamsterNapHookTest is HookTestBase {
     function setUp() public override {
@@ -626,6 +628,164 @@ contract HamsterNapHookTest is HookTestBase {
         hook.failsafe();
     }
 
+    /// A nap the core certified before it stalled belongs to that nap's winner, not to whoever bought
+    /// last: the failsafe settles it first and pays only the fees collected after it.
+    function test_failsafeSettlesCertifiedNapsBeforePaying() public {
+        buy(alice, 1 ether); // round 650: alice is the last buyer before the nap at 651
+        workThrough(650, 650);
+        sleepThrough(651, 653); // certified: a nap at 651 that alice wins
+        warpToRound(660);
+        buy(bob, 0.05 ether); // observes frontier 653, then the core stalls; nobody calls settleNaps
+        assertEq(hook.lastSeenFrontier(), 653);
+        assertEq(hook.scanRound(), 650);
+        vm.warp(hook.failsafeOpensAt());
+
+        (address winner, uint256 amount) = hook.failsafeWinner();
+        assertEq(winner, bob);
+        assertEq(amount, fee(1.05 ether), "the view shows the pot before the certified nap is paid");
+
+        vm.expectEmit(true, true, false, true);
+        emit HamsterNapHook.NapSettled(651, alice, fee(1 ether));
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(0.05 ether), 653);
+        vm.prank(carol);
+        hook.failsafe();
+        assertEq(alice.balance, fee(1 ether), "the certified nap's pot went to its winner");
+        assertEq(bob.balance, fee(0.05 ether), "the failsafe paid only what came after it");
+        assertEq(hook.napsSettled(), 1);
+        assertEq(hook.scanRound(), 654);
+        assertEq(hook.pot(), 0);
+        assertBacked();
+        // The nap is not paid twice by a later claim call.
+        assertEq(hook.settleNaps(1), 0);
+        assertEq(alice.balance, fee(1 ether));
+    }
+
+    /// A backlog longer than the failsafe scans itself must be worked through with settleNaps first;
+    /// the failsafe then pays what the naps in it left.
+    function test_failsafeRefusesToPayOverALongUnsettledBacklog() public {
+        buy(alice, 1 ether); // round 650, before every nap below
+        workThrough(650, 659);
+        sleepThrough(660, 662); // nap at 660: alice's
+        workThrough(663, 999); // 350 rounds certified: 22 pages, more than FAILSAFE_SCAN_PAGES
+        warpToRound(1000);
+        buy(bob, 0.5 ether); // observes frontier 999; the core stalls here
+        vm.warp(hook.failsafeOpensAt());
+
+        uint64 pages = uint64(hook.FAILSAFE_SCAN_PAGES());
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.NapsUnsettled.selector, 650 + pages * 16, 999));
+        hook.failsafe();
+        // The reverted call kept no progress; the nap in the backlog is still alice's.
+        assertEq(hook.scanRound(), 650);
+        assertEq(alice.balance, 0);
+        hook.settleNaps(30);
+        assertEq(hook.scanRound(), 1000);
+        assertEq(alice.balance, fee(1 ether));
+        hook.failsafe();
+        assertEq(bob.balance, fee(0.5 ether));
+        assertEq(hook.pot(), 0);
+        assertBacked();
+    }
+
+    /// When the core cannot be read at all, nothing in the unscanned range can be certified, so the
+    /// failsafe pays the whole pot: a reverting core and a core whose code is gone.
+    function test_failsafePaysEverythingWhenTheBacklogCannotBeRead() public {
+        buy(alice, 1 ether);
+        workThrough(650, 650);
+        sleepThrough(651, 653);
+        warpToRound(660);
+        buy(bob, 0.05 ether); // sees frontier 653; scanRound stays at 650
+        vm.warp(hook.failsafeOpensAt());
+        core.setReverting(true);
+        uint256 snapshot = vm.snapshotState();
+
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.05 ether));
+        assertEq(hook.napsSettled(), 0, "nothing could be certified");
+        assertEq(hook.scanRound(), 650);
+        assertBacked();
+
+        vm.revertToState(snapshot);
+        vm.etch(address(core), ""); // a codeless core answers with empty data that does not decode
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.05 ether));
+        assertEq(hook.napsSettled(), 0);
+        assertBacked();
+    }
+
+    /// Once the failsafe has opened the latest-buyer position is closed: a buy placed after that moment
+    /// (alone, or in the same transaction as the failsafe call) pays its fee into the pot and wins
+    /// nothing, so the pot cannot be sniped for 0.001 ETH.
+    function test_buyAfterTheFailsafeOpenedDoesNotTakeThePot() public {
+        buy(alice, 1 ether);
+        uint256 opensAt = hook.failsafeOpensAt();
+        vm.warp(opensAt - 1);
+        buy(bob, 0.001 ether); // the last second before the failsafe opens still counts
+        vm.warp(opensAt);
+        buy(dave, 0.001 ether); // too late: the failsafe is open
+        assertEq(hook.latestBuyer(), dave, "for the next nap dave is the latest buyer");
+        (address winner, uint256 amount) = hook.failsafeWinner();
+        assertEq(winner, bob);
+        assertEq(amount, fee(1.002 ether), "dave's fee is in the pot bob takes");
+
+        vm.warp(opensAt + 1 days);
+        buy(carol, 0.001 ether);
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(1.003 ether), 649);
+        vm.prank(carol);
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.003 ether));
+        assertEq(dave.balance, 0);
+        assertEq(carol.balance, 0);
+        assertBacked();
+    }
+
+    /// A buy after the failsafe opened still counts for a nap if the core turns out to be alive.
+    function test_buyAfterTheFailsafeOpenedStillCountsForALaterNap() public {
+        buy(alice, 1 ether);
+        vm.warp(hook.failsafeOpensAt() + 1);
+        buy(bob, 0.5 ether); // excluded from the failsafe, but the latest buyer for nap purposes
+        (address winner,) = hook.failsafeWinner();
+        assertEq(winner, alice);
+        // The core was running all along; a claim call sees the advance and the failsafe shuts.
+        uint64 bought = hook.currentRound();
+        workThrough(650, bought);
+        warpToRound(bought + 1);
+        hook.settleNaps(1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, hook.failsafeOpensAt()));
+        hook.failsafe();
+        // A nap after bob's buy pays bob.
+        sleepThrough(bought + 1, bought + 3);
+        warpToRound(bought + 4);
+        hook.settleNaps(100);
+        assertEq(bob.balance, fee(1.5 ether));
+        assertBacked();
+    }
+
+    function test_settleNapsRevertsWhenTheCoreCannotBeRead() public {
+        buy(alice, 1 ether);
+        core.setReverting(true);
+        vm.expectRevert(HamsterNapHook.CoreUnreadable.selector);
+        hook.settleNaps(1);
+        core.setReverting(false);
+        // A core whose state reads but whose pages no longer decode: claims revert, the failsafe
+        // treats the backlog as unreadable.
+        vm.etch(address(core), address(new HalfReadableCore()).code);
+        vm.expectRevert(HamsterNapHook.CoreUnreadable.selector);
+        hook.settleNaps(1);
+        assertEq(hook.lastSeenFrontier(), 649, "the reverted claim recorded nothing");
+        vm.warp(hook.failsafeOpensAt() + 7 days); // the frontier 653 this call sees restarts the clock
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, block.timestamp + 7 days));
+        hook.failsafe();
+        buy(bob, 0.001 ether); // records the sighting of 653 the reverted call could not keep
+        assertEq(hook.lastSeenFrontier(), 653);
+        vm.warp(hook.failsafeOpensAt());
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.001 ether));
+        assertEq(hook.napsSettled(), 0);
+        assertBacked();
+    }
+
     // ---------------------------------------------------------------- a reverting or paused core
 
     function test_sellsAndBuysWorkWhileCoreReverts() public {
@@ -692,6 +852,92 @@ contract HamsterNapHookTest is HookTestBase {
         hook.withdrawOwed();
     }
 
+    /// A winner whose wallet (an EOA carrying EIP-7702 code) answers the payout with a payload sized to
+    /// the gas it was given cannot stall the claim: the payout copies no return data and gives the
+    /// wallet bounded gas, so it is credited in `owed` and the nap, and every nap after it, settles.
+    function test_returnBombWinnerIsCreditedAndDoesNotBlockClaims() public {
+        ReturnBombWinner bomber = new ReturnBombWinner();
+        warpToRound(651);
+        buy(address(bomber), 1 ether); // the last qualifying buyer before the nap at 660
+        warpToRound(665);
+        buy(bob, 2 ether); // the last one before the nap at 670
+        workThrough(650, 659);
+        sleepThrough(660, 662);
+        workThrough(663, 669);
+        sleepThrough(670, 672);
+        warpToRound(673);
+
+        // Reverting with the bomb, with the gas a Sepolia block allows and far more.
+        uint256 snapshot = vm.snapshotState();
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.PayoutDeferred(address(bomber), fee(1 ether));
+        uint256 settled = hook.settleNaps{gas: 30_000_000}(10);
+        assertEq(settled, 2, "both naps settled");
+        assertEq(hook.owed(address(bomber)), fee(1 ether));
+        assertEq(bob.balance, fee(2 ether));
+        assertEq(hook.pot(), 0);
+        assertBacked();
+
+        // Returning the bomb instead of reverting: the transfer succeeds and nothing is copied.
+        vm.revertToState(snapshot);
+        bomber.setReturns(true);
+        assertEq(hook.settleNaps{gas: 30_000_000}(10), 2);
+        assertEq(address(bomber).balance + hook.owed(address(bomber)), fee(1 ether));
+        assertEq(bob.balance, fee(2 ether));
+        assertBacked();
+    }
+
+    /// The failsafe pays through the same bounded call, so the same wallet cannot stall it either, and
+    /// a wallet that drops its code afterwards collects through `withdrawOwed`.
+    function test_returnBombWinnerDoesNotBlockFailsafe() public {
+        ReturnBombWinner bomber = new ReturnBombWinner();
+        buy(address(bomber), 1 ether);
+        vm.warp(hook.failsafeOpensAt());
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.PayoutDeferred(address(bomber), fee(1 ether));
+        hook.failsafe{gas: 30_000_000}();
+        assertEq(hook.owed(address(bomber)), fee(1 ether));
+        assertEq(hook.pot(), 0);
+        assertBacked();
+
+        vm.etch(address(bomber), ""); // the delegation is removed: a plain wallet again
+        vm.prank(address(bomber));
+        hook.withdrawOwed();
+        assertEq(address(bomber).balance, fee(1 ether));
+        assertEq(hook.totalOwed(), 0);
+        assertBacked();
+    }
+
+    /// A payout gives the winner's wallet `PAYOUT_GAS` (plus the EVM's 2300 for a value transfer); a
+    /// wallet that needs more is credited, not paid, and pulls its credit with all the gas it needs.
+    function test_payoutGasIsBounded() public {
+        GasProbeWinner probe = new GasProbeWinner();
+        GasProbeWinner hungry = new GasProbeWinner();
+        hungry.setBurn(150_000);
+        warpToRound(651);
+        buy(address(probe), 1 ether); // wins the nap at 660
+        warpToRound(665);
+        buy(address(hungry), 2 ether); // wins the nap at 670
+        workThrough(650, 659);
+        sleepThrough(660, 662);
+        workThrough(663, 669);
+        sleepThrough(670, 672);
+        warpToRound(673);
+
+        assertEq(hook.settleNaps(10), 2);
+        assertEq(address(probe).balance, fee(1 ether));
+        assertGt(probe.gasSeen(), 90_000, "an ordinary wallet gets the whole stipend");
+        assertLe(probe.gasSeen(), hook.PAYOUT_GAS() + 2300, "never more than the stipend");
+        assertEq(address(hungry).balance, 0);
+        assertEq(hook.owed(address(hungry)), fee(2 ether), "credited: the payout gas ran out in the wallet");
+        assertBacked();
+
+        hungry.setBurn(0);
+        hungry.withdrawFrom(address(hook));
+        assertEq(address(hungry).balance, fee(2 ether));
+        assertBacked();
+    }
+
     // ---------------------------------------------------------------- accounting
 
     /// forge-config: default.fuzz.runs = 200
@@ -750,6 +996,46 @@ contract HamsterNapHookTest is HookTestBase {
         assertEq(hook.owed(address(attacker)), 0);
         assertEq(hook.pot(), 0);
         assertBacked();
+    }
+}
+
+/// @dev A wallet that records the gas a payout gives it and burns `burn` gas before accepting, so it
+/// can stand for a wallet that needs more than the payout stipend.
+contract GasProbeWinner {
+    uint256 public gasSeen;
+    uint256 public burn;
+    uint256 private sink;
+
+    function setBurn(uint256 value) external {
+        burn = value;
+    }
+
+    receive() external payable {
+        gasSeen = gasleft();
+        uint256 start = gasleft();
+        while (start - gasleft() < burn) {
+            sink = start + gasleft();
+        }
+    }
+
+    function withdrawFrom(address hook) external {
+        (bool ok,) = hook.call(abi.encodeWithSignature("withdrawOwed()"));
+        require(ok, "withdraw failed");
+    }
+}
+
+/// @dev A core whose `state()` reads but whose `roundPage` answers with one bare word: the shape of a
+/// core upgraded to another page ABI.
+contract HalfReadableCore {
+    function state() external pure returns (ISqueekCore.CoreState memory result) {
+        result.settledThroughRound = 653;
+    }
+
+    fallback() external {
+        assembly ("memory-safe") {
+            mstore(0, 1)
+            return(0, 32)
+        }
     }
 }
 

@@ -60,6 +60,19 @@
   },
   {
     "type": "function",
+    "name": "FAILSAFE_SCAN_PAGES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "FEE_BPS",
     "inputs": [],
     "outputs": [
@@ -119,6 +132,19 @@
         "name": "",
         "type": "uint64",
         "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "PAYOUT_GAS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "view"
@@ -971,6 +997,11 @@
             "internalType": "uint64"
           },
           {
+            "name": "time",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
             "name": "cumulativeFees",
             "type": "uint128",
             "internalType": "uint128"
@@ -1052,6 +1083,108 @@
   },
   {
     "type": "function",
+    "name": "decodeRoundPage",
+    "inputs": [
+      {
+        "name": "raw",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct ISqueekCore.RoundPage",
+        "components": [
+          {
+            "name": "certifiedThroughRound",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "start",
+            "type": "tuple",
+            "internalType": "struct ISqueekCore.LedgerPosition",
+            "components": [
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              }
+            ]
+          },
+          {
+            "name": "end",
+            "type": "tuple",
+            "internalType": "struct ISqueekCore.LedgerPosition",
+            "components": [
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              }
+            ]
+          },
+          {
+            "name": "rounds",
+            "type": "tuple[]",
+            "internalType": "struct ISqueekCore.RoundCheckpoint[]",
+            "components": [
+              {
+                "name": "roundId",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeWork",
+                "type": "uint64",
+                "internalType": "uint64"
+              },
+              {
+                "name": "cumulativeBlockUnits",
+                "type": "uint96",
+                "internalType": "uint96"
+              },
+              {
+                "name": "workPerThousandBlocks",
+                "type": "uint32",
+                "internalType": "uint32"
+              },
+              {
+                "name": "dataHash",
+                "type": "bytes32",
+                "internalType": "bytes32"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
     "name": "factory",
     "inputs": [],
     "outputs": [
@@ -1077,6 +1210,24 @@
     "outputs": [
       {
         "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "failsafeWinner",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "winner",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -1754,6 +1905,11 @@
   },
   {
     "type": "error",
+    "name": "CoreUnreadable",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "GameNotStarted",
     "inputs": []
   },
@@ -1761,6 +1917,22 @@
     "type": "error",
     "name": "HookNotImplemented",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NapsUnsettled",
+    "inputs": [
+      {
+        "name": "scanRound",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "frontier",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ]
   },
   {
     "type": "error",

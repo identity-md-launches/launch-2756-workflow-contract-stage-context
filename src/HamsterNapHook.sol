@@ -50,6 +50,13 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     uint256 public constant MIN_QUALIFYING_BUY = 0.001 ether;
     /// @notice How long the core's frontier may stand still before the failsafe opens.
     uint256 public constant FAILSAFE_DELAY = 7 days;
+    /// @notice Pages of settled rounds the failsafe itself scans before paying, so every nap the core
+    /// certified before it stalled is paid to its own winner first. A longer backlog is worked through
+    /// with `settleNaps` before the failsafe can pay.
+    uint256 public constant FAILSAFE_SCAN_PAGES = 8;
+    /// @notice Gas a payout gives the winner's wallet. A wallet that needs more, or fails, is credited
+    /// in `owed` and pulls with `withdrawOwed`, which forwards all gas.
+    uint256 public constant PAYOUT_GAS = 100_000;
     /// @notice The Sworn card registry on Ethereum mainnet, read live during the first game there.
     ISworn public constant SWORN = ISworn(0x0da2679000Ea5380d1361cc3Cca7D4e8c881F766);
     /// @notice The only chain on which the Sworn card check runs.
@@ -68,10 +75,12 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
 
     // ---------------------------------------------------------------- game state
 
-    /// @dev The state right after a buy, appended per buy in round order. Binary-searched at claim
-    /// time for the last buy before a nap's first round.
+    /// @dev The state right after a buy, appended per buy in time order. Binary-searched at claim
+    /// time for the last buy before a nap's first round, and at failsafe time for the last buy before
+    /// the failsafe opened.
     struct BuyRecord {
         uint64 round;
+        uint64 time;
         uint128 cumulativeFees;
         address latestBuyer;
     }
@@ -139,6 +148,8 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     error NotFromPoolManager();
     error Reentrancy();
     error ZeroPages();
+    error CoreUnreadable();
+    error NapsUnsettled(uint64 scanRound, uint64 frontier);
 
     constructor(IPoolManager poolManager_, address factory_) BaseHook(poolManager_) {
         factory = factory_;
@@ -269,7 +280,14 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         if (qualifying) latestBuyer = buyer;
         uint64 round = currentRound();
         if (fee > 0 || qualifying) {
-            _buys.push(BuyRecord({round: round, cumulativeFees: cumulativeFees.toUint128(), latestBuyer: latestBuyer}));
+            _buys.push(
+                BuyRecord({
+                    round: round,
+                    time: uint64(block.timestamp),
+                    cumulativeFees: cumulativeFees.toUint128(),
+                    latestBuyer: latestBuyer
+                })
+            );
         }
         emit Buy(buyer, gross, fee, round, qualifying);
         _observeFrontier();
@@ -285,43 +303,24 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     function settleNaps(uint256 maxPages) external nonReentrant returns (uint256 settled) {
         if (maxPages == 0) revert ZeroPages();
         if (scanRound == 0) revert GameNotStarted();
-        uint64 frontier = CORE.state().settledThroughRound;
+        (bool ok, uint64 frontier) = _readFrontier();
+        if (!ok) revert CoreUnreadable();
         _noteFrontier(frontier);
-
-        uint64 from = scanRound;
-        for (uint256 page = 0; page < maxPages && from <= frontier; page++) {
-            uint64 through = from + PAGE_ROUNDS - 1;
-            if (through > frontier) through = frontier;
-            ISqueekCore.RoundPage memory result = CORE.roundPage(from - 1, through, PAGE_ROUNDS);
-            uint64 certified = result.certifiedThroughRound;
-            if (certified > through) certified = through;
-            if (certified < from) break;
-
-            uint256 index;
-            for (uint64 round = from; round <= certified; round++) {
-                bool hadWork = index < result.rounds.length && result.rounds[index].roundId == round;
-                if (hadWork) {
-                    index++;
-                    zeroRun = 0;
-                } else {
-                    if (zeroRun == 0) zeroRunStart = round;
-                    zeroRun++;
-                    if (zeroRun == NAP_ROUNDS) {
-                        _settleNap(zeroRunStart);
-                        settled++;
-                    }
-                }
-            }
-            from = certified + 1;
-        }
-        scanRound = from;
+        bool readable;
+        (settled, readable) = _scan(frontier, maxPages);
+        if (!readable) revert CoreUnreadable();
     }
 
     /// @notice If the core's settled frontier has stood still for 7 days, the pot goes to the last
-    /// qualifying buyer. Anyone may trigger it; only that buyer is paid. Works when the core reverts,
-    /// from the last frontier the hook saw. The 7 days count from the last time the hook saw the
-    /// frontier advance (this call reads the core first, so an advance it finds now restarts them),
-    /// or from the frontier round's end if that is later.
+    /// qualifying buyer whose buy happened before the failsafe opened. Anyone may trigger it; only
+    /// that buyer is paid. Works when the core reverts, from the last frontier the hook saw. The 7
+    /// days count from the last time the hook saw the frontier advance (this call reads the core
+    /// first, so an advance it finds now restarts them), or from the frontier round's end if that is
+    /// later. Every nap the core certified before it stalled is settled first, to its own winner, so
+    /// the failsafe pays only what those naps leave; when more than `FAILSAFE_SCAN_PAGES` pages are
+    /// still unscanned it reverts with `NapsUnsettled` and `settleNaps` must catch up first. When the
+    /// core cannot be read at all, nothing can be certified and the whole pot goes to the failsafe's
+    /// winner.
     function failsafe() external nonReentrant {
         if (scanRound == 0) revert GameNotStarted();
         (bool ok, uint64 frontier) = _readFrontier();
@@ -329,13 +328,23 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         frontier = lastSeenFrontier;
         uint256 staleAt = failsafeOpensAt();
         if (block.timestamp < staleAt) revert CoreNotStale(staleAt);
-        address winner = latestBuyer;
+        if (scanRound <= frontier) {
+            (, bool readable) = _scan(frontier, FAILSAFE_SCAN_PAGES);
+            if (readable && scanRound <= frontier) revert NapsUnsettled(scanRound, frontier);
+        }
+        (address winner,) = _stateBefore(staleAt, true);
         if (winner == address(0)) revert NoQualifyingBuyer();
         uint256 amount = pot();
         if (amount == 0) revert NothingToPay();
         cumulativePaid += amount;
         emit FailsafeTaken(winner, amount, frontier);
         _pay(winner, amount);
+    }
+
+    /// @notice Decodes a raw `roundPage` answer. External only so that `_readPage` can catch a
+    /// malformed answer (a core upgraded to another ABI) instead of reverting the claim.
+    function decodeRoundPage(bytes calldata raw) external pure returns (ISqueekCore.RoundPage memory) {
+        return abi.decode(raw, (ISqueekCore.RoundPage));
     }
 
     /// @notice A winner whose payout could not be delivered, or a buyer owed a partial-fill fee
@@ -419,9 +428,18 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     /// @notice Who would win a nap that begins at `napStart`, and how much, from the records so far.
     function winnerBefore(uint64 napStart) external view returns (address winner, uint256 amount) {
         uint256 cumulative;
-        (winner, cumulative) = _stateBefore(napStart);
+        (winner, cumulative) = _stateBefore(napStart, false);
         if (winner == address(0) || cumulative <= cumulativePaid) return (winner, 0);
         amount = cumulative - cumulativePaid;
+    }
+
+    /// @notice Who the failsafe would pay if it opened at `failsafeOpensAt()` as known now (the last
+    /// qualifying buyer whose buy happened before that moment), and the pot it would take before any
+    /// certified nap still to be settled is paid out of it.
+    function failsafeWinner() external view returns (address winner, uint256 amount) {
+        (winner,) = _stateBefore(failsafeOpensAt(), true);
+        if (winner == address(0)) return (winner, 0);
+        amount = pot();
     }
 
     /// @notice The earliest timestamp at which the failsafe opens, given what the hook has seen so
@@ -507,26 +525,82 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         }
     }
 
-    /// @dev The state after the last buy before round `napStart` started.
-    function _stateBefore(uint64 napStart) private view returns (address winner, uint256 cumulative) {
+    /// @dev Scans up to `maxPages` pages of settled rounds from `scanRound` through `frontier` and
+    /// settles every nap found, in order. `readable` is false when the core's `roundPage` could not
+    /// be read or certified nothing; the scan stops there and `scanRound` keeps what was done.
+    function _scan(uint64 frontier, uint256 maxPages) private returns (uint256 settled, bool readable) {
+        readable = true;
+        uint64 from = scanRound;
+        for (uint256 page = 0; page < maxPages && from <= frontier; page++) {
+            uint64 through = from + PAGE_ROUNDS - 1;
+            if (through > frontier) through = frontier;
+            (bool ok, ISqueekCore.RoundPage memory result) = _readPage(from, through);
+            uint64 certified = ok ? result.certifiedThroughRound : 0;
+            if (certified > through) certified = through;
+            if (certified < from) {
+                readable = false;
+                break;
+            }
+
+            uint256 index;
+            for (uint64 round = from; round <= certified; round++) {
+                bool hadWork = index < result.rounds.length && result.rounds[index].roundId == round;
+                if (hadWork) {
+                    index++;
+                    zeroRun = 0;
+                } else {
+                    if (zeroRun == 0) zeroRunStart = round;
+                    zeroRun++;
+                    if (zeroRun == NAP_ROUNDS) {
+                        _settleNap(zeroRunStart);
+                        settled++;
+                    }
+                }
+            }
+            from = certified + 1;
+        }
+        scanRound = from;
+    }
+
+    /// @dev Reads one page of rounds `from..through` without letting a reverting, codeless or
+    /// re-ABI'd core revert the caller: the caller decides what an unreadable core means.
+    function _readPage(uint64 from, uint64 through) private view returns (bool ok, ISqueekCore.RoundPage memory page) {
+        (bool success, bytes memory ret) =
+            address(CORE).staticcall(abi.encodeCall(ISqueekCore.roundPage, (from - 1, through, PAGE_ROUNDS)));
+        if (!success) return (false, page);
+        try this.decodeRoundPage(ret) returns (ISqueekCore.RoundPage memory decoded) {
+            return (true, decoded);
+        } catch {
+            return (false, page);
+        }
+    }
+
+    /// @dev The state after the last recorded buy strictly before `bound`: a round (the first round
+    /// of a nap) when `byTime` is false, a timestamp (when the failsafe opened) when it is true.
+    /// Records are appended in time order, so both keys are non-decreasing along `_buys`.
+    function _stateBefore(uint256 bound, bool byTime) private view returns (address winner, uint256 cumulative) {
         uint256 length = _buys.length;
-        if (length == 0 || _buys[0].round >= napStart) return (address(0), 0);
-        // Largest index whose round < napStart. _buys[lo].round < napStart holds throughout.
+        if (length == 0 || _keyOf(_buys[0], byTime) >= bound) return (address(0), 0);
+        // Largest index whose key < bound. _buys[lo].key < bound holds throughout.
         uint256 lo = 0;
         uint256 hi = length - 1;
         while (lo < hi) {
             uint256 mid = (lo + hi + 1) / 2;
-            if (_buys[mid].round < napStart) lo = mid;
+            if (_keyOf(_buys[mid], byTime) < bound) lo = mid;
             else hi = mid - 1;
         }
         BuyRecord storage record = _buys[lo];
         return (record.latestBuyer, record.cumulativeFees);
     }
 
+    function _keyOf(BuyRecord storage record, bool byTime) private view returns (uint256) {
+        return byTime ? record.time : record.round;
+    }
+
     function _settleNap(uint64 napStart) private {
         napsSettled++;
         firstNapSettled = true;
-        (address winner, uint256 cumulative) = _stateBefore(napStart);
+        (address winner, uint256 cumulative) = _stateBefore(napStart, false);
         uint256 amount;
         if (winner != address(0) && cumulative > cumulativePaid) {
             amount = cumulative - cumulativePaid;
@@ -537,9 +611,15 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     }
 
     /// @dev Pays a winner; a winner that cannot receive ETH is credited instead and never blocks.
+    /// The call gives the wallet a bounded `PAYOUT_GAS` and copies none of its return data, so a
+    /// wallet (an EOA with EIP-7702 code included) that burns gas or answers with a huge payload can
+    /// only fail its own payout, never the claim that carries it.
     function _pay(address winner, uint256 amount) private {
         _ensureEth(amount);
-        (bool ok,) = winner.call{value: amount}("");
+        bool ok;
+        assembly ("memory-safe") {
+            ok := call(PAYOUT_GAS, winner, amount, 0, 0, 0, 0)
+        }
         if (!ok) {
             owed[winner] += amount;
             totalOwed += amount;
