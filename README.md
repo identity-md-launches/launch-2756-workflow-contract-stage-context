@@ -89,15 +89,23 @@ longer ships one); it validates the address flags in the constructor and calls n
 Rules as implemented, with the constants in `HamsterNapHook`:
 
 1. **Buy fee.** A buy (ETH in, NAP out; ETH is always `currency0`) pays `FEE_BPS` = 200 basis
-   points, 2% of the ETH the buyer spends, fee included. Exact input: fee = 2% of the input.
-   Exact output: fee = pool ETH × 200 / 9800, so the fee is 2% of the gross. Sells pay no game fee.
-   The fee is settled in ETH inside the swap: the hook takes native ETH when the PoolManager's ETH
-   balance covers it, and mints itself an ERC-6909 ETH claim when it does not (a fresh manager or
-   a pool seeded with tokens only). Claims are redeemed into ETH before any payout, and anyone may
-   call `redeemClaims()`. Nothing is ever left in NAP.
-2. **Latest buyer.** A buy of at least `MIN_QUALIFYING_BUY` = 0.001 ETH (gross) makes the
-   transaction's sender wallet, `tx.origin`, the latest buyer, as the brief specifies. Smaller
-   buys still pay the fee into the pot. The buy's SqueekCore round is recorded with it.
+   points, 2% of the ETH the buyer really spends, fee included. Exact input: `beforeSwap` reserves
+   2% of the offered input and the pool swaps the other 98%; `afterSwap` reads the ETH the pool
+   actually consumed from the pool's own delta. On a full fill the fee is the reservation. On a
+   partial fill (a price limit or exhausted liquidity left part of the input unused) the fee is
+   pool ETH × 200 / 9800, 2% of the executed gross, and the unused part of the reservation is
+   credited to the buyer in `owed` (event `FeeRefunded`), pulled with `withdrawOwed()`. Nothing is
+   pushed to anyone during the swap, so the refund cannot fail or be griefed. Exact output: fee =
+   pool ETH × 200 / 9800 on the ETH actually paid, so a partial fill is right by construction.
+   Sells pay no game fee. The fee is settled in ETH inside the swap: the hook takes native ETH
+   when the PoolManager's ETH balance covers it, and mints itself an ERC-6909 ETH claim when it
+   does not (a fresh manager or a pool seeded with tokens only). Claims are redeemed into ETH
+   before any payout, and anyone may call `redeemClaims()`. Nothing is ever left in NAP.
+2. **Latest buyer.** A buy whose executed gross (pool ETH plus fee) is at least
+   `MIN_QUALIFYING_BUY` = 0.001 ETH makes the transaction's sender wallet, `tx.origin`, the latest
+   buyer, as the brief specifies. The input a buyer offered but the pool did not use counts for
+   nothing: a 0.001 ETH order that fills for a sliver is a dust buy. Smaller buys still pay the fee
+   into the pot. The buy's SqueekCore round is recorded with it.
 3. **Nap.** `NAP_ROUNDS` = 3 consecutive settled rounds with zero work. It begins at its first
    zero-work round `s`. A run of more than three zero-work rounds is one nap and pays once; the
    next nap can only begin after a round with work.
@@ -111,11 +119,17 @@ Rules as implemented, with the constants in `HamsterNapHook`:
    in order, and keeps its position between calls, so a long gap can be worked through in several
    transactions. A nap whose third round is not yet certified waits.
 6. **Winners that cannot receive ETH** are credited in `owed` and pull with `withdrawOwed()`.
-   The game never blocks on a payout.
+   The game never blocks on a payout. `owed` also holds partial-fill fee refunds (rule 1).
 7. **Failsafe.** When the core's `settledThroughRound` has stood still for `FAILSAFE_DELAY` =
-   7 days (the frontier round ended 7 days ago or more), `failsafe()` sends the whole pot to the
-   last qualifying buyer. Anyone may trigger it; only that buyer is paid. If the core reverts, the
-   last frontier the hook saw is used.
+   7 days, `failsafe()` sends the whole pot to the last qualifying buyer. Anyone may trigger it;
+   only that buyer is paid. The hook sees the frontier only when it reads the core (every buy,
+   every claim call and the failsafe itself), so it dates staleness conservatively from
+   `frontierSeenAt`, the moment it last saw the frontier advance, or from the frontier round's end
+   if that is later: `failsafeOpensAt()` = max(`roundEnd(lastSeenFrontier)`, `frontierSeenAt`) +
+   7 days. An advance the failsafe call itself finds restarts the 7 days, so a core recovering a
+   backlog is never stale however old the rounds it is settling. Until the core has been read once
+   (a core unreadable from the start), the clock runs from the game's start, not from genesis. If
+   the core reverts, the last frontier and sighting the hook recorded are used.
 8. **First game, mainnet only.** On chain id 1, until the first nap is settled, a buy requires
    `balanceOf(tx.origin) >= 1` on the Sworn registry `0x0da2679000ea5380d1361cc3cca7d4e8c881f766`,
    read live on every buy. On Sepolia and every other chain the check is skipped. Sells always
@@ -123,14 +137,16 @@ Rules as implemented, with the constants in `HamsterNapHook`:
 9. **The core is read only at swap and claim time.** Buys read `state()` through a staticcall
    that tolerates a reverting or codeless core; sells never read it. Constructors read nothing.
 
-Events: `Buy` for every recorded buy (with `qualifying`), `NapSettled`, `FailsafeTaken`,
-`PayoutDeferred`, `OwedWithdrawn`, `ClaimsRedeemed`, `FrontierSeen`, `GameStarted`, `PoolBound`.
+Events: `Buy` for every recorded buy (with the executed gross, the fee and `qualifying`),
+`NapSettled`, `FailsafeTaken`, `PayoutDeferred`, `FeeRefunded`, `OwedWithdrawn`,
+`ClaimsRedeemed`, `FrontierSeen`, `GameStarted`, `PoolBound`.
 
 ### Where the ETH goes
 
 Every wei of fee goes into the pot and leaves it only to a nap winner or the failsafe winner.
-Nothing goes to the owner, the requester, IMD or any other address. Invariant kept by the tests:
-`hook ETH balance + claimsHeld == pot() + totalOwed`.
+Nothing goes to the owner, the requester, IMD or any other address. The only other ETH the hook
+holds is what it owes back: deferred payouts and partial-fill refunds, both in `owed`. Invariant
+kept by the tests: `hook ETH balance + claimsHeld == pot() + totalOwed`.
 
 ## SqueekCore facts used
 
@@ -154,18 +170,25 @@ not follow; the failsafe is the exit.
 
 ## Tests
 
-`forge test` runs 58 tests in five suites (the verifier re-runs them with
+`forge test` runs 67 tests in five suites (the verifier re-runs them with
 `FOUNDRY_FUZZ_SEED=0xfbaf61498d090e9328f47570cd503c9b9f7a6967092682129c4f05d58ca2d30c`):
 
 - `test/HamsterNapHook.t.sol`: permissions, callback access, initialization from the factory
   only and once, native pair only; fees on exact-input and exact-output buys, no fee on sells,
-  dust buys, the 0.001 ETH threshold, `tx.origin` as the buyer; the round boundary (a buy in the
-  last second before round `s` against the first second of `s`), naps of 2 against 3 rounds, a
-  nap not yet fully settled, a long nap paying once, buys during a nap, several naps in one call,
-  pagination, a nap with no qualifying buyer; the failsafe (closed, open, with a reverting core,
-  without a buyer); a reverting, codeless or paused core with sells and buys still working; a
-  winner contract that rejects ETH and later withdraws; a re-entrant winner; and a fuzzed ETH
-  accounting run (pot = fees in − payouts) over mixed buys, exact-output buys and sells.
+  dust buys, the 0.001 ETH threshold, `tx.origin` as the buyer; partial fills against a price
+  limit (a 0.001 ETH order that fills for dust pays 2% of the executed ETH, gets the rest of its
+  reservation back through `owed`, does not take the latest-buyer position and does not win the
+  nap; a partial fill above the threshold still qualifies; a near-zero fill pays nothing and is
+  not recorded; a partial exact-output fill; the exact `Buy` and `FeeRefunded` figures; a fuzz
+  over offered amounts and limits); the round boundary (a buy in the last second before round `s`
+  against the first second of `s`), naps of 2 against 3 rounds, a nap not yet fully settled, a
+  long nap paying once, buys during a nap, several naps in one call, pagination, a nap with no
+  qualifying buyer; the failsafe (closed, open, shut again when a buy or the failsafe call itself
+  sees the frontier advance after eight idle days, dated from the game's start with a core that
+  was never readable, with a reverting core, without a buyer); a reverting, codeless or paused
+  core with sells and buys still working; a winner contract that rejects ETH and later withdraws;
+  a re-entrant winner; and a fuzzed ETH accounting run (pot = fees in − payouts) over mixed buys,
+  exact-output buys and sells.
 - `test/HamsterNapHook.claims.t.sol`: a fresh PoolManager whose pool was seeded with tokens only:
   the first buy's fee becomes an ERC-6909 claim, later fees come as ETH, claims are redeemed by
   anyone, by a nap payout and by the failsafe.
@@ -212,8 +235,19 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
   page is zero work, per the docs. Rounds past the frontier are unknown and are not scanned.
 - Exact-output buys pay a fee equal to 2% of the gross (net × 200 / 9800), so both buy kinds pay
   the same rate on what the buyer spends.
-- The failsafe is callable by anyone but pays only the last qualifying buyer; "not advanced for 7
-  days" is measured as the frontier round's end plus 7 days, which needs no observation history.
+- v4 lets a hook change the specified side of a swap only in `beforeSwap`, before the fill is
+  known, so an exact-input buy's 2% is reserved on the offered input and reconciled in
+  `afterSwap` against the pool's real fill. The unused reservation is refunded as a credit in
+  `owed`, not pushed during the swap: a push to the router would be lost by most routers, a push
+  to the wallet could fail or re-enter, and a credit never blocks the swap. The buyer settles the
+  full reservation with the PoolManager and pulls the difference with `withdrawOwed()`. The
+  website should show a wallet's `owed` balance next to the buy panel.
+- The failsafe is callable by anyone but pays only the last qualifying buyer. "Not advanced for 7
+  days" is dated from the hook's last sighting of an advance (`frontierSeenAt`), or from the
+  frontier round's end if later. The sighting is an upper bound on when the core really settled
+  that round, so the failsafe can open late but never early. Between interactions the hook sees
+  nothing, so a core that advanced while nobody traded is noticed, and the clock restarted, by
+  the very call that tries the failsafe.
 - The hook accepts ETH only from the PoolManager, so stray transfers cannot muddle the pot.
 - Payouts forward all gas with a reentrancy lock and state updated before the call; a failing
   payout is credited, never retried automatically.
@@ -229,6 +263,8 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
   covers about a day. After a long idle stretch call it repeatedly; progress is kept.
 - **Winner that cannot receive ETH.** A contract wallet without a payable fallback is credited
   in `owed` and must call `withdrawOwed()` itself.
+- **Partial-fill refunds.** A buyer whose exact-input buy stopped at a price limit has the unused
+  fee reservation in `owed` and pulls it with `withdrawOwed()`; it never expires.
 - **Dependency risk.** If SqueekCore pauses or breaks, buys and sells keep working, claims revert
   until it returns, and the failsafe opens after seven days. If it is upgraded with a different
   read ABI, claims revert and the failsafe is the way out.

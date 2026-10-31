@@ -84,8 +84,9 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     uint256 public cumulativeFees;
     /// @notice All fees ever paid out (or credited to a winner that could not receive ETH), in wei.
     uint256 public cumulativePaid;
-    /// @notice ETH credited to winners whose payout transfer failed; they pull it with `withdrawOwed`.
-    mapping(address winner => uint256 amount) public owed;
+    /// @notice ETH a wallet may pull with `withdrawOwed`: a winner's payout whose transfer failed, or
+    /// the part of an exact-input buy's fee reservation a partial fill did not use.
+    mapping(address wallet => uint256 amount) public owed;
     /// @notice The sum of `owed`.
     uint256 public totalOwed;
     /// @notice ERC-6909 ETH claims on the PoolManager the hook holds instead of ETH.
@@ -99,6 +100,9 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     uint64 public zeroRunStart;
     /// @notice The highest `settledThroughRound` the hook has read from the core.
     uint64 public lastSeenFrontier;
+    /// @notice When the hook last saw `settledThroughRound` advance; the game's start until it does.
+    /// The failsafe's seven days count from here (or from the frontier round's end, if later).
+    uint256 public frontierSeenAt;
     /// @notice Naps settled (paid or found without a winner) so far.
     uint256 public napsSettled;
     /// @notice True once the first nap is settled: the end of the first game.
@@ -114,6 +118,7 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     event NapSettled(uint64 indexed napStart, address indexed winner, uint256 amount);
     event FailsafeTaken(address indexed winner, uint256 amount, uint64 frontier);
     event PayoutDeferred(address indexed winner, uint256 amount);
+    event FeeRefunded(address indexed buyer, uint256 amount);
     event OwedWithdrawn(address indexed winner, uint256 amount);
     event ClaimsRedeemed(uint256 amount);
     event FrontierSeen(uint64 frontier);
@@ -206,8 +211,9 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         _checkSworn();
 
         if (params.amountSpecified < 0) {
-            // Exact input: the specified currency is ETH. The hook takes the fee from it here so the
-            // pool swaps the remaining 98%; the ETH itself is collected in afterSwap.
+            // Exact input: the specified currency is ETH. The hook reserves 2% of it here so the pool
+            // swaps the remaining 98%; afterSwap collects the ETH and, if the pool filled only part of
+            // the input, keeps 2% of what was really spent and refunds the rest of the reservation.
             uint256 fee = _feeOnGross(uint256(-params.amountSpecified));
             return (this.beforeSwap.selector, toBeforeSwapDelta(fee.toInt128(), 0), 0);
         }
@@ -215,7 +221,8 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     }
 
     /// @notice Collects the fee in ETH, records the buy and the latest buyer. Starts the game on the
-    /// pool's first swap of either direction.
+    /// pool's first swap of either direction. The fee and the 0.001 ETH threshold are measured on the
+    /// ETH the buy really spent (the pool's fill plus the fee), never on an input the pool did not use.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         override
@@ -226,26 +233,38 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         _startGameIfNeeded();
         if (!params.zeroForOne) return (this.afterSwap.selector, 0);
 
+        address buyer = tx.origin;
+        // `delta` is the pool's own delta, before the hook's share is added: the ETH it consumed.
+        uint256 poolEth = uint256(uint128(-delta.amount0()));
         uint256 fee;
         uint256 gross;
         int128 hookDeltaUnspecified;
         if (params.amountSpecified < 0) {
-            gross = uint256(-params.amountSpecified);
-            fee = _feeOnGross(gross);
+            // Exact input: beforeSwap reserved 2% of the specified input and the manager credits the
+            // hook that much whatever the pool filled. A price limit or exhausted liquidity can leave
+            // part of the input unused; then the fee is 2% of what was really spent and the unused
+            // part of the reservation goes back to the buyer through `owed`.
+            uint256 specified = uint256(-params.amountSpecified);
+            uint256 reserved = _feeOnGross(specified);
+            if (poolEth + reserved >= specified) {
+                fee = reserved;
+                gross = specified;
+            } else {
+                fee = _feeOnPoolEth(poolEth);
+                if (fee > reserved) fee = reserved;
+                gross = poolEth + fee;
+                _refund(buyer, reserved - fee);
+            }
+            if (reserved > 0) _collectFee(reserved);
         } else {
             // Exact output: the pool's ETH input is the unspecified side; the hook adds the fee to it.
-            uint256 poolEth = uint256(uint128(-delta.amount0()));
             fee = _feeOnPoolEth(poolEth);
             gross = poolEth + fee;
             hookDeltaUnspecified = fee.toInt128();
+            if (fee > 0) _collectFee(fee);
         }
+        cumulativeFees += fee;
 
-        if (fee > 0) {
-            _collectFee(fee);
-            cumulativeFees += fee;
-        }
-
-        address buyer = tx.origin;
         bool qualifying = gross >= MIN_QUALIFYING_BUY;
         if (qualifying) latestBuyer = buyer;
         uint64 round = currentRound();
@@ -300,13 +319,15 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
 
     /// @notice If the core's settled frontier has stood still for 7 days, the pot goes to the last
     /// qualifying buyer. Anyone may trigger it; only that buyer is paid. Works when the core reverts,
-    /// from the last frontier the hook saw.
+    /// from the last frontier the hook saw. The 7 days count from the last time the hook saw the
+    /// frontier advance (this call reads the core first, so an advance it finds now restarts them),
+    /// or from the frontier round's end if that is later.
     function failsafe() external nonReentrant {
         if (scanRound == 0) revert GameNotStarted();
         (bool ok, uint64 frontier) = _readFrontier();
         if (ok) _noteFrontier(frontier);
         frontier = lastSeenFrontier;
-        uint256 staleAt = roundEnd(frontier) + FAILSAFE_DELAY;
+        uint256 staleAt = failsafeOpensAt();
         if (block.timestamp < staleAt) revert CoreNotStale(staleAt);
         address winner = latestBuyer;
         if (winner == address(0)) revert NoQualifyingBuyer();
@@ -317,7 +338,8 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         _pay(winner, amount);
     }
 
-    /// @notice A winner whose payout could not be delivered pulls it here.
+    /// @notice A winner whose payout could not be delivered, or a buyer owed a partial-fill fee
+    /// refund, pulls it here.
     function withdrawOwed() external nonReentrant {
         uint256 amount = owed[msg.sender];
         if (amount == 0) revert NothingOwed();
@@ -402,9 +424,13 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         amount = cumulative - cumulativePaid;
     }
 
-    /// @notice The earliest timestamp at which the failsafe opens, given the last frontier seen.
-    function failsafeOpensAt() external view returns (uint256) {
-        return roundEnd(lastSeenFrontier) + FAILSAFE_DELAY;
+    /// @notice The earliest timestamp at which the failsafe opens, given what the hook has seen so
+    /// far: 7 days after the later of the last observed frontier advance (the game's start, if the
+    /// core has never been readable) and the frontier round's end. A later observed advance moves it.
+    function failsafeOpensAt() public view returns (uint256) {
+        uint256 since = roundEnd(lastSeenFrontier);
+        if (frontierSeenAt > since) since = frontierSeenAt;
+        return since + FAILSAFE_DELAY;
     }
 
     // ---------------------------------------------------------------- internals
@@ -430,17 +456,29 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         uint64 round = currentRound();
         if (round == 0) round = 1;
         scanRound = round;
+        // Until the core is read for the first time, the failsafe's clock starts here, not at genesis.
+        frontierSeenAt = block.timestamp;
         emit GameStarted(round);
     }
 
-    /// @dev The hook is owed `fee` of ETH by the PoolManager at the end of this swap. Take it as ETH
-    /// when the manager already holds enough; otherwise mint an ERC-6909 claim, redeemed later.
-    function _collectFee(uint256 fee) private {
-        if (address(poolManager).balance >= fee) {
-            poolManager.take(CurrencyLibrary.ADDRESS_ZERO, address(this), fee);
+    /// @dev Credits `buyer` the part of a fee reservation the pool's fill did not earn, pulled later
+    /// with `withdrawOwed`. The hook already collected it from the manager, so it is always backed.
+    function _refund(address buyer, uint256 amount) private {
+        if (amount == 0) return;
+        owed[buyer] += amount;
+        totalOwed += amount;
+        emit FeeRefunded(buyer, amount);
+    }
+
+    /// @dev The hook is credited `amount` of ETH by the PoolManager at the end of this swap (the fee,
+    /// plus any part of an exact-input reservation to be refunded). Take it as ETH when the manager
+    /// already holds enough; otherwise mint an ERC-6909 claim, redeemed later.
+    function _collectFee(uint256 amount) private {
+        if (address(poolManager).balance >= amount) {
+            poolManager.take(CurrencyLibrary.ADDRESS_ZERO, address(this), amount);
         } else {
-            poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fee);
-            claimsHeld += fee;
+            poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), amount);
+            claimsHeld += amount;
         }
     }
 
@@ -459,9 +497,12 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         return (true, uint64(word));
     }
 
+    /// @dev Records an observed advance of the frontier and when it was seen. The observation time
+    /// is the conservative date for the failsafe: the core settled the round no later than this.
     function _noteFrontier(uint64 frontier) private {
         if (frontier > lastSeenFrontier) {
             lastSeenFrontier = frontier;
+            frontierSeenAt = block.timestamp;
             emit FrontierSeen(frontier);
         }
     }

@@ -107,7 +107,9 @@ contract HamsterNapHookSepoliaTest is HookTestBase {
         warpToRound(643);
         buy(alice, 1 ether);
         assertEq(hook.lastSeenFrontier(), 642);
+        // The buy, which first saw frontier 642, happened in the first second after round 642 ended.
         uint256 opensAt = roundEnd(642) + 7 days;
+        assertEq(hook.failsafeOpensAt(), opensAt);
         vm.warp(opensAt - 1);
         vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
         hook.failsafe();

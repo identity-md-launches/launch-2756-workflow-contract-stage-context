@@ -171,6 +171,137 @@ contract HamsterNapHookTest is HookTestBase {
         assertEq(hook.latestBuyer(), alice);
     }
 
+    // ---------------------------------------------------------------- partial fills
+
+    /// @dev The fee and the threshold follow the ETH a buy really spent, not the input it offered.
+    function test_partialDustFillDoesNotQualifyAndPaysFeeOnExecutedEth() public {
+        buy(alice, 1 ether);
+        // Bob offers 0.001 ETH but a tight price limit lets the pool take only a sliver of it.
+        uint160 price = currentSqrtPrice();
+        uint256 reserved = fee(0.001 ether);
+        BalanceDelta delta = buyWithLimit(bob, -int256(0.001 ether), price - price / 1e12);
+        uint256 paid = uint256(uint128(-delta.amount0()));
+        assertGt(delta.amount1(), 0, "Bob did receive tokens");
+        assertLt(paid, 0.001 ether, "the fill is dust");
+        // The buyer settled pool ETH plus the whole reservation; the hook keeps 2% of the real spend.
+        uint256 poolEth = paid - reserved;
+        uint256 due = poolEth * 200 / 9800;
+        assertGt(due, 0);
+        assertEq(hook.cumulativeFees(), fee(1 ether) + due, "fee on executed ETH only");
+        assertEq(hook.owed(bob), reserved - due, "the unused reservation is Bob's");
+        assertEq(hook.totalOwed(), reserved - due);
+        assertEq(hook.latestBuyer(), alice, "a dust fill does not take the position");
+        assertEq(hook.buyCount(), 2);
+        assertEq(hook.buyAt(1).latestBuyer, alice);
+        assertBacked();
+
+        vm.prank(bob);
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.OwedWithdrawn(bob, reserved - due);
+        hook.withdrawOwed();
+        assertEq(bob.balance, reserved - due);
+        assertEq(hook.totalOwed(), 0);
+        assertBacked();
+
+        // Alice, not Bob, wins the nap that follows.
+        workThrough(650, 650);
+        sleepThrough(651, 653);
+        warpToRound(654);
+        uint256 potBefore = hook.pot();
+        assertEq(hook.settleNaps(1), 1);
+        assertEq(alice.balance, potBefore);
+        assertEq(hook.pot(), 0);
+        assertBacked();
+    }
+
+    function test_partialFillEmitsExecutedAmountsAndRefund() public {
+        uint160 price = currentSqrtPrice();
+        uint256 reserved = fee(0.001 ether);
+        // Dry run on a snapshot to learn the fill, then expect exactly those figures in the events.
+        uint256 snapshot = vm.snapshotState();
+        BalanceDelta delta = buyWithLimit(bob, -int256(0.001 ether), price - price / 1e12);
+        uint256 poolEth = uint256(uint128(-delta.amount0())) - reserved;
+        vm.revertToState(snapshot);
+        uint256 due = poolEth * 200 / 9800;
+
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FeeRefunded(bob, reserved - due);
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.Buy(bob, poolEth + due, due, 650, false);
+        buyWithLimit(bob, -int256(0.001 ether), price - price / 1e12);
+    }
+
+    function test_partialFillThatStillSpendsEnoughQualifies() public {
+        buy(alice, 1 ether);
+        // Bob offers 10 ETH; the limit stops the pool after roughly 1 ETH.
+        uint160 price = currentSqrtPrice();
+        uint256 reserved = fee(10 ether);
+        BalanceDelta delta = buyWithLimit(bob, -int256(10 ether), price - price / 1e6);
+        uint256 paid = uint256(uint128(-delta.amount0()));
+        assertLt(paid, 10 ether, "partial");
+        uint256 poolEth = paid - reserved;
+        uint256 due = poolEth * 200 / 9800;
+        assertGe(poolEth + due, 0.001 ether);
+        assertEq(hook.cumulativeFees(), fee(1 ether) + due);
+        assertEq(hook.owed(bob), reserved - due);
+        assertEq(hook.latestBuyer(), bob, "a partial fill above the threshold still qualifies");
+        assertBacked();
+    }
+
+    function test_nearZeroFillRefundsTheWholeReservationAndRecordsNothing() public {
+        buy(alice, 1 ether);
+        uint160 price = currentSqrtPrice();
+        uint256 reserved = fee(1 ether);
+        // One tick of sqrt price: the pool fills a few wei at most, too little for a 1 wei fee.
+        BalanceDelta delta = buyWithLimit(bob, -int256(1 ether), price - 1);
+        uint256 poolEth = uint256(uint128(-delta.amount0())) - reserved;
+        assertLt(poolEth, 49, "no fee is due on so small a fill");
+        assertEq(hook.cumulativeFees(), fee(1 ether), "no fee charged");
+        assertEq(hook.owed(bob), reserved, "the whole reservation comes back");
+        assertEq(hook.buyCount(), 1, "nothing recorded");
+        assertEq(hook.latestBuyer(), alice);
+        assertBacked();
+    }
+
+    function test_partialExactOutputFillPaysFeeOnExecutedEth() public {
+        buy(alice, 1 ether);
+        uint160 price = currentSqrtPrice();
+        BalanceDelta delta = buyWithLimit(bob, int256(1_000_000 ether), price - price / 1e9);
+        assertLt(delta.amount1(), 1_000_000 ether, "partial output");
+        uint256 gross = uint256(uint128(-delta.amount0()));
+        uint256 due = hook.cumulativeFees() - fee(1 ether);
+        assertApproxEqAbs(due, gross * 200 / 10_000, 1, "2% of what was spent");
+        assertEq(hook.owed(bob), 0, "exact output never over-reserves");
+        assertEq(hook.latestBuyer(), gross >= 0.001 ether ? bob : alice);
+        assertBacked();
+    }
+
+    /// forge-config: default.fuzz.runs = 64
+    function testFuzz_partialFillFeeIsTwoPercentOfExecutedEth(uint96 offered, uint32 limitSteps) public {
+        buy(alice, 1 ether);
+        uint256 amount = bound(uint256(offered), 50, 100 ether);
+        // A limit between one tick below the price and one percent below it.
+        uint160 price = currentSqrtPrice();
+        uint256 steps = bound(uint256(limitSteps), 1, 1e6);
+        uint160 limit = uint160(uint256(price) - uint256(price) / 100 * steps / 1e6);
+        if (limit >= price) limit = price - 1;
+        uint256 reserved = fee(amount);
+        BalanceDelta delta = buyWithLimit(bob, -int256(amount), limit);
+        uint256 paid = uint256(uint128(-delta.amount0()));
+        assertLe(paid, amount);
+        uint256 poolEth = paid - reserved;
+        uint256 due = hook.cumulativeFees() - fee(1 ether);
+        if (paid == amount) {
+            assertEq(due, reserved, "a full fill pays the reservation");
+            assertEq(hook.owed(bob), 0);
+        } else {
+            assertEq(due, poolEth * 200 / 9800 > reserved ? reserved : poolEth * 200 / 9800);
+            assertEq(hook.owed(bob), reserved - due);
+        }
+        assertEq(hook.latestBuyer(), poolEth + due >= 0.001 ether ? bob : alice);
+        assertBacked();
+    }
+
     // ---------------------------------------------------------------- claims
 
     function test_claimBeforeAnySwapReverts() public {
@@ -371,10 +502,14 @@ contract HamsterNapHookTest is HookTestBase {
     // ---------------------------------------------------------------- failsafe
 
     function test_failsafePaysLastQualifyingBuyerAfterSevenStaleDays() public {
+        uint256 firstSeen = block.timestamp;
         buy(alice, 1 ether);
-        buy(bob, 0.5 ether);
+        vm.warp(block.timestamp + 1 hours);
+        buy(bob, 0.5 ether); // the frontier did not move: the clock still runs from the first sighting
         assertEq(hook.lastSeenFrontier(), 649);
-        uint256 opensAt = roundEnd(649) + 7 days;
+        assertEq(hook.frontierSeenAt(), firstSeen);
+        uint256 opensAt = firstSeen + 7 days;
+        assertGt(opensAt, roundEnd(649) + 7 days, "the sighting, 17 seconds into round 650, is the later date");
         assertEq(hook.failsafeOpensAt(), opensAt);
 
         vm.warp(opensAt - 1);
@@ -397,24 +532,96 @@ contract HamsterNapHookTest is HookTestBase {
     function test_failsafeNotOpenWhileCoreAdvances() public {
         buy(alice, 1 ether);
         vm.warp(roundEnd(649) + 7 days);
-        // The core kept settling: its frontier is current, so the failsafe stays shut.
+        // The core kept settling: its frontier is current. The failsafe reads it, sees the advance
+        // for the first time now, and stays shut for another seven days.
         uint64 current = hook.currentRound();
         workThrough(650, current - 1);
-        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, roundEnd(current - 1) + 7 days));
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, block.timestamp + 7 days));
+        hook.failsafe();
+        // The reverted call kept nothing; a claim call records the same sighting.
+        hook.settleNaps(1);
+        assertEq(hook.lastSeenFrontier(), current - 1);
+        assertEq(hook.frontierSeenAt(), block.timestamp);
+        assertEq(hook.failsafeOpensAt(), block.timestamp + 7 days);
+    }
+
+    function test_failsafeRestartsWhenABuyObservesAFreshAdvance() public {
+        // Round 650, frontier 649. Nobody touches the hook for eight days while the core catches up.
+        buy(alice, 1 ether);
+        assertEq(hook.lastSeenFrontier(), 649);
+        vm.warp(block.timestamp + 8 days);
+        // The core advances one round, far behind the clock. Bob's buy observes the advance.
+        core.setFrontier(650);
+        buy(bob, 0.001 ether);
+        assertEq(hook.lastSeenFrontier(), 650);
+        assertEq(hook.frontierSeenAt(), block.timestamp);
+        uint256 opensAt = block.timestamp + 7 days;
+        assertEq(hook.failsafeOpensAt(), opensAt);
+        // Round 650 ended more than eight days ago, but the frontier moved just now: not stale.
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        vm.warp(opensAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        // Seven unchanged days later the pot goes to the last qualifying buyer.
+        vm.warp(opensAt);
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(1.001 ether), 650);
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.001 ether));
+        assertBacked();
+    }
+
+    function test_failsafeRestartsWhenItObservesAFreshAdvanceItself() public {
+        buy(alice, 1 ether);
+        vm.warp(block.timestamp + 8 days);
+        core.setFrontier(650);
+        // No swap or claim saw the advance; the failsafe call itself does, and stays shut.
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, block.timestamp + 7 days));
+        hook.failsafe();
+        // A claim call that finds no nap still records the sighting and restarts the clock the same way.
+        vm.warp(block.timestamp + 6 days);
+        core.setFrontier(651);
+        assertEq(hook.settleNaps(1), 0);
+        assertEq(hook.lastSeenFrontier(), 651);
+        assertEq(hook.frontierSeenAt(), block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, block.timestamp + 7 days));
         hook.failsafe();
     }
 
     function test_failsafeWorksWhenCoreReverts() public {
         buy(alice, 1 ether);
         core.setReverting(true);
-        vm.warp(roundEnd(649) + 7 days);
+        // The core stopped answering right after the buy that saw frontier 649: dated from that buy.
+        vm.warp(hook.failsafeOpensAt() - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, hook.failsafeOpensAt()));
+        hook.failsafe();
+        vm.warp(hook.failsafeOpensAt());
+        hook.failsafe();
+        assertEq(alice.balance, fee(1 ether));
+    }
+
+    function test_failsafeWithNeverReadableCoreDatesFromTheGameStart() public {
+        // The core has no code from the start: the frontier stays at zero and nothing is observed.
+        vm.etch(address(core), "");
+        vm.warp(roundStart(700) + 5);
+        uint256 gameStart = block.timestamp;
+        buy(alice, 1 ether);
+        assertEq(hook.lastSeenFrontier(), 0);
+        assertEq(hook.frontierSeenAt(), gameStart);
+        // Genesis is long past, but the clock runs from the game's start, not from round zero's end.
+        assertEq(hook.failsafeOpensAt(), gameStart + 7 days);
+        vm.warp(gameStart + 7 days - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, gameStart + 7 days));
+        hook.failsafe();
+        vm.warp(gameStart + 7 days);
         hook.failsafe();
         assertEq(alice.balance, fee(1 ether));
     }
 
     function test_failsafeNeedsAQualifyingBuyer() public {
         buy(alice, 0.0001 ether);
-        vm.warp(roundEnd(649) + 7 days);
+        vm.warp(hook.failsafeOpensAt());
         vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
         hook.failsafe();
     }

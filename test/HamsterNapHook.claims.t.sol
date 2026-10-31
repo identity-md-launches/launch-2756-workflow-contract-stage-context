@@ -73,7 +73,7 @@ contract HamsterNapHookClaimsTest is HookTestBase {
 
     function test_failsafeRedeemsClaimsFirst() public {
         buy(alice, 1 ether);
-        vm.warp(roundEnd(649) + 7 days);
+        vm.warp(hook.failsafeOpensAt());
         hook.failsafe();
         assertEq(alice.balance, 0.02 ether);
         assertEq(hook.claimsHeld(), 0);

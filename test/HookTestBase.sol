@@ -9,6 +9,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {HamsterNapHook} from "../src/HamsterNapHook.sol";
 import {NapToken} from "../src/NapToken.sol";
 import {HookFlags} from "../src/HookFlags.sol";
@@ -112,6 +113,18 @@ abstract contract HookTestBase is Test {
     function sell(address seller, uint256 tokensIn) internal returns (BalanceDelta) {
         vm.prank(seller, seller);
         return swapper.swap(key, false, tokensIn);
+    }
+
+    /// @dev A buy the pool may fill only partly: it stops at `limit` (a sqrt price below the current one).
+    /// Negative `amountSpecified` is exact input (ETH), positive exact output (NAP).
+    function buyWithLimit(address buyer, int256 amountSpecified, uint160 limit) internal returns (BalanceDelta) {
+        vm.prank(buyer, buyer);
+        return swapper.swapWithLimit(key, true, amountSpecified, limit);
+    }
+
+    /// @dev The pool's current sqrt price.
+    function currentSqrtPrice() internal view returns (uint160 sqrtPrice) {
+        (sqrtPrice,,,) = StateLibrary.getSlot0(manager, key.toId());
     }
 
     // ---------------------------------------------------------------- rounds and the core

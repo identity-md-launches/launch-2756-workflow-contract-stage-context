@@ -26,12 +26,20 @@ contract Swapper is IUnlockCallback {
 
     /// @notice Exact-input swap of `amountIn` of the input currency.
     function swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) external returns (BalanceDelta) {
-        return _swap(key, zeroForOne, -int256(amountIn));
+        return _swap(key, zeroForOne, -int256(amountIn), 0);
     }
 
     /// @notice A swap with a signed amount: negative is exact input, positive exact output.
     function swapExact(PoolKey memory key, bool zeroForOne, int256 amountSpecified) external returns (BalanceDelta) {
-        return _swap(key, zeroForOne, amountSpecified);
+        return _swap(key, zeroForOne, amountSpecified, 0);
+    }
+
+    /// @notice A swap bounded by a sqrt price limit, so the pool may fill only part of the amount.
+    function swapWithLimit(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        external
+        returns (BalanceDelta)
+    {
+        return _swap(key, zeroForOne, amountSpecified, limit);
     }
 
     /// @notice Adds (or with a negative or zero delta removes/collects) liquidity on this router's position.
@@ -44,8 +52,12 @@ contract Swapper is IUnlockCallback {
         return abi.decode(result, (BalanceDelta));
     }
 
-    function _swap(PoolKey memory key, bool zeroForOne, int256 amountSpecified) private returns (BalanceDelta) {
-        bytes memory result = manager.unlock(abi.encode(Action.Swap, abi.encode(key, zeroForOne, amountSpecified)));
+    function _swap(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        private
+        returns (BalanceDelta)
+    {
+        bytes memory result =
+            manager.unlock(abi.encode(Action.Swap, abi.encode(key, zeroForOne, amountSpecified, limit)));
         return abi.decode(result, (BalanceDelta));
     }
 
@@ -55,9 +67,11 @@ contract Swapper is IUnlockCallback {
         BalanceDelta delta;
         PoolKey memory key;
         if (action == Action.Swap) {
-            (PoolKey memory k, bool zeroForOne, int256 amountSpecified) = abi.decode(inner, (PoolKey, bool, int256));
+            (PoolKey memory k, bool zeroForOne, int256 amountSpecified, uint160 limit) =
+                abi.decode(inner, (PoolKey, bool, int256, uint160));
             key = k;
-            uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+            // No limit given: swap to the edge of the price range.
+            if (limit == 0) limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
             delta = manager.swap(key, SwapParams(zeroForOne, amountSpecified, limit), "");
         } else {
             (PoolKey memory k, int24 lower, int24 upper, int256 liquidity) =
