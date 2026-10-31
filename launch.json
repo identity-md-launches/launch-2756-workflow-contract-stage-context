@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "HamsterNapHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$factory"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "NapToken",
+    "name": "Hamster Nap",
+    "symbol": "NAP",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Hamster Nap (NAP) on Sepolia. The hook constructor takes the PoolManager and launch factory in that order and reads no external contracts. beforeInitialize accepts only the factory via PoolManager, binds one native-ETH pool and learns its token from PoolKey.currency1. NapToken has no constructor arguments. Neither contract has owner, pause or upgrade powers. Buys charge a 2% game fee on executed gross ETH, separate from the pool's 1.25% LP fee; sells pay no game fee and never read SqueekCore. Buys spending at least 0.001 ETH record tx.origin as the latest qualifying buyer; smaller buys still contribute fees. The fixed SqueekCore proxy is 0x980b4424c007caf7a1f3670b48c8eaef7ebc3d44, with genesis 1793022600 and 600-second rounds. Three consecutive settled zero-work rounds form a nap. Anyone can call settleNaps to process naps in order, paying fees collected before each nap's start to the last qualifying buyer before that start; later fees remain for later games. A continuous zero-work run pays once. Fees become ERC-6909 ETH claims if PoolManager lacks ETH, redeemable through redeemClaims or before payout. Failed winner transfers and unused partial-fill fee reservations become withdrawOwed credits. The seven-day failsafe pays the latest qualifying buyer, measured from the later of the last observed frontier advance (initially game start) and the frontier round's end. The first-game Sworn check applies only on mainnet and is skipped on Sepolia. pool.initialPrice records the required reference value; the deployer derives the actual opening price from the launch policy."
+}
