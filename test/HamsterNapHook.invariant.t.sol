@@ -21,7 +21,7 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         seedTokensOnly(1_000_000 ether);
         handler = new NapSequenceHandler(hook, sequenceCore, swapper, key);
         handler.buy(1 ether, 0, 2);
-        bytes4[] memory selectors = new bytes4[](_includeFailsafe() ? 10 : 9);
+        bytes4[] memory selectors = new bytes4[](_includeFailsafe() ? 11 : 9);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.sell.selector;
         selectors[2] = handler.advanceAndCertify.selector;
@@ -31,7 +31,10 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         selectors[6] = handler.receiverStatus.selector;
         selectors[7] = handler.withdraw.selector;
         selectors[8] = handler.buyLimited.selector;
-        if (_includeFailsafe()) selectors[9] = handler.takeFailsafeAfterSevenUnchangedDays.selector;
+        if (_includeFailsafe()) {
+            selectors[9] = handler.takeFailsafeAfterSevenUnchangedDays.selector;
+            selectors[10] = handler.takeFailsafeAfterExtraWait.selector;
+        }
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -117,6 +120,20 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         handler.settle(3);
         handler.takeFailsafeAfterSevenUnchangedDays();
         assertEq(handler.failsafes(), 2);
+        handler.checkModel();
+    }
+
+    function test_handlerReachesRollingFailsafeCutoffWithDeadCore() public {
+        handler.coreStatus(1); // the core reverts from here on
+        handler.takeFailsafeAfterSevenUnchangedDays(); // the setUp buyer takes the fees through the opening
+        assertEq(handler.failsafes(), 1);
+        handler.buy(1 ether, 1, 2); // Bob, after the payout
+        handler.takeFailsafeAfterExtraWait(0); // Bob's buy is not seven days old: NothingToPay
+        assertEq(handler.failsafes(), 1);
+        handler.takeFailsafeAfterExtraWait(uint32(7 days + 1));
+        assertEq(handler.failsafes(), 2);
+        assertEq(handler.actors(1).balance, 0.02 ether, "the later qualifying buyer is paid its own fee");
+        assertEq(hook.pot(), 0);
         handler.checkModel();
     }
 }

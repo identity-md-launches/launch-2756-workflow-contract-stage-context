@@ -179,12 +179,23 @@ contract NapSequenceHandler is Test {
     }
 
     function takeFailsafeAfterSevenUnchangedDays() external {
+        _failsafe(0);
+    }
+
+    /// @notice The failsafe called up to ten days after it opened, so the rolling cutoff (the later of
+    /// the opening and seven days ago) reaches buys made after the opening or after an earlier payout.
+    function takeFailsafeAfterExtraWait(uint32 extraSeed) external {
+        _failsafe(bound(extraSeed, 0, 10 days));
+    }
+
+    function _failsafe(uint256 extra) private {
         // Seven days after the later of the last sighting and the sighted round's end. An advance
         // the hook has not seen yet must keep the failsafe shut, however old the advanced round is.
         uint256 since = 1793022600 + uint256(observedFrontier) * 600;
         if (observedAt > since) since = observedAt;
         uint256 at = since + 7 days;
         if (at > vm.getBlockTimestamp()) vm.warp(at);
+        if (extra > 0) vm.warp(vm.getBlockTimestamp() + extra);
         bool unseenAdvance = !core.unavailable() && core.frontier() > observedFrontier;
         if (cursor == 0) {
             vm.expectRevert(HamsterNapHook.GameNotStarted.selector);
@@ -210,10 +221,16 @@ contract NapSequenceHandler is Test {
                 return;
             }
         }
-        // The winner is the last qualifying buyer whose buy happened strictly before the failsafe opened.
+        // Rule 5 with the anti-sniping cutoff: the winner is the last qualifying buyer whose buy happened
+        // strictly before the later of the opening and seven days ago, and it is owed the fees paid
+        // through the last buy before that cutoff that no nap or earlier failsafe has paid yet.
+        uint256 cutoff = vm.getBlockTimestamp() - 7 days;
+        if (at > cutoff) cutoff = at;
         address winner;
+        uint256 throughCutoff;
         for (uint256 i; i < history.length; i++) {
-            if (history[i].time >= at) break;
+            if (history[i].time >= cutoff) break;
+            throughCutoff += history[i].fee;
             if (history[i].qualifyingBuyer != address(0)) winner = history[i].qualifyingBuyer;
         }
         if (winner == address(0)) {
@@ -233,7 +250,7 @@ contract NapSequenceHandler is Test {
             awardsBefore[i] = awards[actors[i]];
         }
         if (!core.unavailable()) _scanThrough(observedFrontier);
-        if (fees == allocated) {
+        if (throughCutoff <= allocated) {
             naps = napsBefore;
             allocated = allocatedBefore;
             cursor = cursorBefore;
@@ -248,8 +265,8 @@ contract NapSequenceHandler is Test {
             return;
         }
         failsafeNaps += naps - napsBefore;
-        awards[winner] += fees - allocated;
-        allocated = fees;
+        awards[winner] += throughCutoff - allocated;
+        allocated = throughCutoff;
         failsafes++;
         hook.failsafe();
     }

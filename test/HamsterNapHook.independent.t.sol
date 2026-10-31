@@ -420,8 +420,10 @@ contract HamsterNapHookIndependentTest is HookTestBase {
         assertBacked();
     }
 
-    /// @dev The failsafe winner is fixed at the second the failsafe opens: a qualifying buy one second
-    /// before it counts, a buy at that second or later pays into the pot and wins nothing from it.
+    /// @dev The failsafe's cutoff is the later of its opening and seven days ago. A qualifying buy one
+    /// second before the opening counts at the opening; a buy at the opening or later pays into the pot,
+    /// wins nothing when placed in front of the call, and is paid its own fee, and only that, to the
+    /// buyer once it is more than seven days old with the core still dead. Nobody is paid twice.
     /// forge-config: default.fuzz.runs = 512
     function testFuzz_failsafeWinnerBoundary(uint32 earlySeed, uint32 lateSeed, uint96 lateEthSeed) public {
         buy(alice, 1 ether);
@@ -436,18 +438,79 @@ contract HamsterNapHookIndependentTest is HookTestBase {
         vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
         hook.failsafe();
         vm.warp(opensAt + late);
+        uint256 lateAt = block.timestamp;
         buy(dave, lateEth);
         assertEq(hook.failsafeOpensAt(), opensAt, "a buy that reads nothing cannot move the clock");
-        uint256 expected = fee(1 ether) + fee(0.001 ether) + fee(lateEth);
+        uint256 early_ = fee(1 ether) + fee(0.001 ether);
         (address winner, uint256 amount) = hook.failsafeWinner();
         assertEq(winner, bob);
-        assertEq(amount, expected);
+        assertEq(amount, early_);
         hook.failsafe();
-        assertEq(bob.balance, expected);
-        assertEq(dave.balance, 0);
-        assertEq(hook.pot(), 0);
+        assertEq(bob.balance, early_);
+        assertEq(dave.balance, 0, "a buy in front of the call takes nothing");
+        assertEq(hook.pot(), fee(lateEth), "the late fee waits in the pot");
         vm.expectRevert(HamsterNapHook.NothingToPay.selector);
         hook.failsafe();
+        // Exactly seven days after the late buy it is not yet strictly before the cutoff.
+        vm.warp(lateAt + 7 days);
+        (winner, amount) = hook.failsafeWinner();
+        assertEq(amount, 0);
+        vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+        hook.failsafe();
+        vm.warp(lateAt + 7 days + 1);
+        (winner, amount) = hook.failsafeWinner();
+        assertEq(winner, dave);
+        assertEq(amount, fee(lateEth));
+        vm.prank(carol);
+        hook.failsafe();
+        assertEq(dave.balance, fee(lateEth));
+        assertEq(bob.balance, early_, "the earlier winner is not paid again");
+        assertEq(hook.pot(), 0);
+        assertEq(hook.cumulativePaid(), hook.cumulativeFees());
+        assertBacked();
+    }
+
+    /// @dev Settled finding (failsafe frozen at the first opening), case 2: a game opened by a dust buy
+    /// has no qualifying buyer at the opening. A qualifying buy after the opening is paid the whole pot,
+    /// the dust fee included, once it is more than seven days old; before that the call refuses.
+    function test_failsafeOpenedByDustPaysLaterQualifyingBuyerAfterSevenDays() public {
+        buy(alice, 0.0005 ether);
+        core.setReverting(true);
+        uint256 opensAt = hook.failsafeOpensAt();
+        vm.warp(opensAt + 1);
+        vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
+        hook.failsafe();
+        buy(bob, 1 ether);
+        uint256 boughtAt = block.timestamp;
+        vm.warp(boughtAt + 7 days);
+        vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
+        hook.failsafe();
+        vm.warp(boughtAt + 7 days + 1);
+        hook.failsafe();
+        assertEq(bob.balance, fee(0.0005 ether) + fee(1 ether));
+        assertEq(alice.balance, 0, "a dust buyer never qualifies");
+        assertEq(hook.pot(), 0);
+        assertBacked();
+    }
+
+    /// @dev A dust buy after the cutoff's last qualifying buy is paid to that buyer once it ages too: the
+    /// dust buyer cannot take the position, and its fee is not locked.
+    function test_failsafeDustFeeAfterPayoutReachesLastQualifyingBuyer() public {
+        buy(alice, 1 ether);
+        core.setReverting(true);
+        vm.warp(hook.failsafeOpensAt());
+        hook.failsafe();
+        assertEq(alice.balance, fee(1 ether));
+        buy(carol, 0.0005 ether);
+        uint256 dustAt = block.timestamp;
+        vm.warp(dustAt + 7 days + 1);
+        (address winner, uint256 amount) = hook.failsafeWinner();
+        assertEq(winner, alice);
+        assertEq(amount, fee(0.0005 ether));
+        hook.failsafe();
+        assertEq(alice.balance, fee(1 ether) + fee(0.0005 ether));
+        assertEq(carol.balance, 0);
+        assertEq(hook.pot(), 0);
         assertBacked();
     }
 }

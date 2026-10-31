@@ -5,9 +5,9 @@ configuration, dependencies, and ABI exports are unchanged.
 
 | File | Coverage |
 | --- | --- |
-| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core; price-limited partial fills (exact input and exact output) on both sides of the boundary second, their refunds to a rejecting sender wallet, a late backlog that restarts the failsafe clock, and sells that cannot move it; a failsafe over a partly readable backlog that pays the certified nap to its own winner first; 512 fuzz cases at the failsafe's opening second (a buy one second before counts, a buy at or after it wins nothing). |
+| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core; price-limited partial fills (exact input and exact output) on both sides of the boundary second, their refunds to a rejecting sender wallet, a late backlog that restarts the failsafe clock, and sells that cannot move it; a failsafe over a partly readable backlog that pays the certified nap to its own winner first; 512 fuzz cases at the failsafe's rolling cutoff (a buy one second before the opening counts; a buy at or after it wins nothing in front of the call, and is paid its own fee only once it is more than seven days old, to the second); a game opened by dust paying the first later qualifying buyer; a dust fee after a payout reaching the last qualifying buyer. |
 | `HamsterNapHook.fork.t.sol` | Five live-core tests at Sepolia block **12030457**, including every captured work record in rounds 483–642, configuration/frontier and invalid page bounds, three historical naps paid in order, and fresh token-only pool claim redemption. |
-| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. Three deterministic companions prove a deferred payout, withdrawal, failsafe, partial-fill refund, an unseen-advance `CoreNotStale`, a failsafe that settles a certified nap first, and a `NapsUnsettled` refusal over a 160-round backlog are reachable. |
+| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. Four deterministic companions prove a deferred payout, withdrawal, failsafe, partial-fill refund, an unseen-advance `CoreNotStale`, a failsafe that settles a certified nap first, and a `NapsUnsettled` refusal over a 160-round backlog, and a second failsafe payout to a buyer who qualified after the first are reachable. |
 | `independent/NapSequenceHandler.sol` | Random exact-input/output buys (full and price-limited partial fills) and sells, time advances, append-only certification, reverting/paused core, page-limited settlement, claim redemption, receiver rejection and withdrawals. |
 | `independent/SequenceCore.sol` | Efficient offline model of sparse settled-round pages. Only closed rounds can be certified, and certified work never changes. |
 
@@ -21,8 +21,10 @@ that sighting (or the sighted round's end) and to revert `CoreNotStale` while an
 unseen. For the failsafe it walks the certified backlog itself: more than eight pages (128 rounds)
 unscanned must revert `NapsUnsettled` with the exact scan position, otherwise every certified nap is
 paid to its own winner first (rolled back with the call if it then reverts `NothingToPay`), and the
-rest goes to the last qualifying buyer whose buy happened strictly before the failsafe opened. A
-reverting core skips the scan and the whole pot goes to that buyer. `settleNaps` on an unreadable
+fees paid through the last buy strictly before the cutoff (the later of the opening and seven days
+ago) that nothing has paid yet go to the last qualifying buyer before that cutoff; `NothingToPay`
+when there are none. The recovery campaign also calls the failsafe up to ten days after it opened,
+so later payouts over the rolling cutoff are exercised. A reverting core skips the scan. `settleNaps` on an unreadable
 core must revert `CoreUnreadable`. It checks the actual PoolManager ERC-6909 balance against `claimsHeld`, fee and refund
 conservation, the pot and debt backing, `lastSeenFrontier` / `frontierSeenAt`, scan progress,
 nap counts, and NAP supply/balances. The handler
@@ -68,17 +70,17 @@ check the fixes rather than restating the findings:
    a frontier advance. Checked by `test_lateBacklogSeenByClaimRestartsFailsafeClock`,
    `test_onlyBuysAndClaimsMoveFailsafeClock` and the recovery campaign's observation-dated model.
 
-## Finding this round
+## Finding from the previous round, settled
 
-The implementation changed after the last round: the failsafe now settles certified naps first and
-pays the last qualifying buyer *before the failsafe opened*. The tests above cover that design. One
-consequence is reported in `.imd-findings.json` (medium) and is not asserted anywhere in this suite.
-With a dead core the opening moment never moves. So after one failsafe payout, every later fee goes
-to the same stale buyer, failsafe after failsafe. And if no qualifying buy came before the opening,
-`failsafe()` reverts `NoQualifyingBuyer` for ever, which locks every later fee. Both break rule 5
-("the last qualifying buyer can take the pot"). The finding carries a self-contained proof that fails
-on the current code. The invariant model only calls the failsafe at its opening moment, so it never
-hits this case.
+**Failsafe winner frozen at the first opening** (medium). The author fixed it with a rolling cutoff,
+max(`failsafeOpensAt()`, now − 7 days), and now pays only the fees through the winner's last buy
+before that cutoff. These tests check the fix against both cases of the reproduction:
+`testFuzz_failsafeWinnerBoundary` (a later buyer is paid its own fee exactly once at 7 days + 1
+second, the earlier winner nothing more), `test_failsafeOpenedByDustPaysLaterQualifyingBuyerAfterSevenDays`
+(a dust-only opening refuses `NoQualifyingBuyer` until the buy is more than seven days old, then pays
+the whole pot), `test_failsafeDustFeeAfterPayoutReachesLastQualifyingBuyer`, and the recovery
+campaign's `takeFailsafeAfterExtraWait` action, which models the rolling cutoff independently. A buy
+placed in front of the call still takes nothing. No new finding this round.
 
 ## Remaining limits (not defects)
 
