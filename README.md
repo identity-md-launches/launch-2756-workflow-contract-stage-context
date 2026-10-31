@@ -128,19 +128,26 @@ Rules as implemented, with the constants in `HamsterNapHook`:
    `withdrawOwed()` forwards all gas, so a wallet that needs more than the stipend collects
    there. `owed` also holds partial-fill fee refunds (rule 1).
 7. **Failsafe.** When the core's `settledThroughRound` has stood still for `FAILSAFE_DELAY` =
-   7 days, `failsafe()` pays the pot to the failsafe winner: the last qualifying buyer whose buy
-   happened before the failsafe opened (`failsafeOpensAt()` as known at the call). Anyone may
-   trigger it; only that buyer is paid. A buy at or after that moment pays its fee into the pot
-   but cannot take the failsafe position, so the pot cannot be sniped with a 0.001 ETH buy
-   placed ahead of the failsafe call; it still counts as a normal buy for the next nap if the
-   core turns out to be alive. `failsafeWinner()` shows who that is and what the pot holds.
+   7 days, `failsafe()` pays the failsafe winner: the last qualifying buyer whose buy happened
+   before the failsafe's cutoff, `failsafeCutoff()` = max(`failsafeOpensAt()`, now − 7 days).
+   It pays the fees collected through that buyer's last recorded buy before the cutoff that are
+   not yet paid out; fees from later buys stay in the pot. Anyone may trigger it; only that buyer
+   is paid. A buy after the cutoff pays its fee into the pot but cannot take the failsafe
+   position now, so the pot cannot be sniped with a 0.001 ETH buy placed ahead of the failsafe
+   call; it still counts as a normal buy for the next nap if the core turns out to be alive. The
+   cutoff rolls forward with time while the core stands still, so if the core never returns the
+   failsafe can be called again: seven days after a later buy, its fee (and any dust fees since
+   the previous payout) goes to the buyer who was the last qualifying buyer when it was paid, and
+   a buyer who first qualified after the opening is paid once their buy is seven days old. No
+   fee is ever locked and no earlier winner is paid twice. `failsafeWinner()` shows who the
+   failsafe would pay now and how much; `NothingToPay` means nothing is payable yet.
    Before paying, the failsafe settles every nap the core certified before it stalled, through
    `lastSeenFrontier`, each to its own winner, so a nap that nobody claimed during the stall is
    not swept into the failsafe: it scans up to `FAILSAFE_SCAN_PAGES` = 8 pages (128 rounds, about
    21 hours) itself and reverts with `NapsUnsettled(scanRound, frontier)` when more is pending,
    in which case `settleNaps` must catch up first. When the core's pages cannot be read at all
    (a reverting, codeless or re-ABI'd core), nothing in the backlog can be certified and the
-   whole pot goes to the failsafe winner.
+   fees through the cutoff all go to the failsafe winner.
    The hook sees the frontier only when it reads the core (every buy,
    every claim call and the failsafe itself), so it dates staleness conservatively from
    `frontierSeenAt`, the moment it last saw the frontier advance, or from the frontier round's end
@@ -162,7 +169,8 @@ Events: `Buy` for every recorded buy (with the executed gross, the fee and `qual
 
 Views for the website: `pot()`, `latestBuyer()`, `buyCount()` / `buyAt(i)` (round, timestamp,
 fees through it, latest buyer then), `winnerBefore(napStart)`, `failsafeWinner()`,
-`failsafeOpensAt()`, `scanRound()`, `zeroRun()`, `lastSeenFrontier()`, `owed(wallet)`.
+`failsafeOpensAt()`, `failsafeCutoff()`, `scanRound()`, `zeroRun()`, `lastSeenFrontier()`,
+`owed(wallet)`.
 `decodeRoundPage(bytes)` is a pure helper the hook calls on itself to read the core's pages
 tolerantly; it has no state and nothing to protect.
 
@@ -195,7 +203,7 @@ not follow; the failsafe is the exit.
 
 ## Tests
 
-`forge test` runs 76 tests in five suites (the verifier re-runs them with
+`forge test` runs 78 tests in five suites (the verifier re-runs them with
 `FOUNDRY_FUZZ_SEED=0xfbaf61498d090e9328f47570cd503c9b9f7a6967092682129c4f05d58ca2d30c`):
 
 - `test/HamsterNapHook.t.sol`: permissions, callback access, initialization from the factory
@@ -214,7 +222,10 @@ not follow; the failsafe is the exit.
   to its own winner before the failsafe pays the rest; `NapsUnsettled` over a 22-page backlog
   until `settleNaps` catches up; the whole pot when the backlog cannot be read from a reverting
   or codeless core; a buy at the moment the failsafe opens, or later, not taking the pot while a
-  buy one second earlier does; such a late buy still counting for a later nap when the core
+  buy one second earlier does, its own fee waiting in the pot and reaching it seven days later;
+  with a dead core, a buyer who qualifies after an earlier payout paid once their buy is seven
+  days old and the earlier winner not paid again, and a game opened by dust only paying the
+  first later qualifying buyer; such a late buy still counting for a later nap when the core
   proves alive); a reverting, codeless, paused or re-ABI'd core with sells and buys still
   working and claims reverting with `CoreUnreadable`; a winner contract that rejects ETH and
   later withdraws; a winner wallet that answers the payout with a gas-sized revert or return
@@ -276,17 +287,21 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
   to the wallet could fail or re-enter, and a credit never blocks the swap. The buyer settles the
   full reservation with the PoolManager and pulls the difference with `withdrawOwed()`. The
   website should show a wallet's `owed` balance next to the buy panel.
-- The failsafe is callable by anyone but pays only the last qualifying buyer before it opened.
+- The failsafe is callable by anyone but pays only the last qualifying buyer before its cutoff.
   "Not advanced for 7 days" is dated from the hook's last sighting of an advance
   (`frontierSeenAt`), or from the frontier round's end if later. The sighting is an upper bound
   on when the core really settled that round, so the failsafe can open late but never early.
   Between interactions the hook sees nothing, so a core that advanced while nobody traded is
   noticed, and the clock restarted, by the very call that tries the failsafe. The brief's rule 5
-  says only "the last qualifying buyer can take the pot"; reading it as the last buyer *when
-  the failsafe opened* (rather than at the moment of the call) is our choice: the alternative
-  made the failsafe a race that any 0.001 ETH buy in front of the real buyer's transaction
-  would win. Fees from buys after the opening go to that winner too; leaving them in the pot
-  would strand them if the core never returns.
+  says only "the last qualifying buyer can take the pot"; reading it as the last buyer *before
+  the cutoff* (the opening, or seven days ago if later) rather than at the moment of the call is
+  our choice: the alternative made the failsafe a race that any 0.001 ETH buy in front of the
+  real buyer's transaction would win. The cutoff rolls with time rather than staying at the
+  first opening so that, with a core that never returns, a buyer who qualifies later is still
+  the one paid for the fees through their buy, once it is seven days old: a cutoff frozen at
+  the opening paid every later fee to the first winner, or locked them when nobody had
+  qualified before the opening. The failsafe therefore pays the fees through the winner's last
+  buy before the cutoff, not the whole pot; later fees wait for their own seven days.
 - The failsafe pays what certified naps leave, never a certified nap's own pot: a nap the core
   certified before stalling (its three rounds inside `lastSeenFrontier`) belongs to the last
   buyer before it under rule 4, whoever bought later. Beyond 8 unscanned pages the failsafe
@@ -323,6 +338,10 @@ v4-core's `ProtocolFees` imports. v4-periphery is not used.
 - **Failsafe with a backlog.** If `failsafe()` reverts with `NapsUnsettled`, call
   `settleNaps(maxPages)` until `scanRound` passes `lastSeenFrontier`, then call it again. The
   website's Claim button covers the first step; `failsafeWinner()` shows who the failsafe pays.
+- **Failsafe after the core is gone for good.** Buys keep working and keep paying fees. Call
+  `failsafe()` again whenever `failsafeWinner()` shows an amount: seven days after the latest
+  buy, the fees since the previous payout go to the buyer who was last when they were paid.
+  `NothingToPay` means the fees in the pot are not seven days old yet.
 - **Partial-fill refunds.** A buyer whose exact-input buy stopped at a price limit has the unused
   fee reservation in `owed` and pulls it with `withdrawOwed()`; it never expires.
 - **Dependency risk.** If SqueekCore pauses or breaks, buys and sells keep working, claims revert
@@ -337,10 +356,20 @@ Nothing to set: the hook has no owner-settable values. All outside addresses the
 (the SqueekCore proxy, the Sworn registry) are constants, and the PoolManager and factory come
 from the launch as `$poolManager` and `$factory`.
 
-## Changes in the review revision
+## Changes in the review revisions
 
-The independent review reopened the first accepted version with two reproducible defects, both
-fixed here with regression tests (`.imd-responses.json` answers each finding):
+The second review reopened the revised version with one reproducible defect, fixed here with
+regression tests (`.imd-responses.json` answers each finding):
+
+- With a dead core the failsafe winner was frozen at the first opening: every later qualifying
+  buyer's fee went to that first winner at every later `failsafe()` call, and when nobody had
+  qualified before the opening every later fee was locked behind `NoQualifyingBuyer`. The
+  failsafe's cutoff now rolls, max(opening, now − 7 days), and the failsafe pays the fees
+  through the winner's last buy before it instead of the whole pot (rule 7, `failsafeCutoff()`).
+  The anti-sniping property is kept: a buy in front of the failsafe call still wins nothing.
+
+The first review reopened the first accepted version with two reproducible defects, both
+fixed with regression tests:
 
 - A winner's wallet answering the payout with a gas-sized payload made `settleNaps` and
   `failsafe` run out of memory gas at any gas limit, freezing every later nap. Payouts now use
@@ -351,5 +380,7 @@ fixed here with regression tests (`.imd-responses.json` answers each finding):
   what is left.
 - Advisory, also changed: the failsafe winner is fixed at the moment the failsafe opened
   (`BuyRecord.time`, `failsafeWinner()`), closing a 0.001 ETH buy-and-call race for the pot.
+  The second revision replaced that fixed moment with the rolling cutoff above, which keeps the
+  race closed.
 - Advisory, documented and kept: the partial-fill refund goes to `tx.origin`, and fees round
   down (see Assumptions).

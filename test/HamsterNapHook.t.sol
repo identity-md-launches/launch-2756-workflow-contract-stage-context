@@ -713,30 +713,118 @@ contract HamsterNapHookTest is HookTestBase {
         assertBacked();
     }
 
-    /// Once the failsafe has opened the latest-buyer position is closed: a buy placed after that moment
-    /// (alone, or in the same transaction as the failsafe call) pays its fee into the pot and wins
-    /// nothing, so the pot cannot be sniped for 0.001 ETH.
+    /// A buy placed after the failsafe's cutoff (alone, or in the same transaction as the failsafe
+    /// call) pays its fee into the pot and wins nothing now, so the pot cannot be sniped for 0.001 ETH.
+    /// Its fee waits in the pot and goes, seven days later, to the buyer who was last when it was paid.
     function test_buyAfterTheFailsafeOpenedDoesNotTakeThePot() public {
         buy(alice, 1 ether);
         uint256 opensAt = hook.failsafeOpensAt();
+        assertEq(hook.failsafeCutoff(), opensAt, "before the opening the cutoff is the opening");
         vm.warp(opensAt - 1);
         buy(bob, 0.001 ether); // the last second before the failsafe opens still counts
         vm.warp(opensAt);
         buy(dave, 0.001 ether); // too late: the failsafe is open
         assertEq(hook.latestBuyer(), dave, "for the next nap dave is the latest buyer");
+        assertEq(hook.failsafeCutoff(), opensAt);
         (address winner, uint256 amount) = hook.failsafeWinner();
         assertEq(winner, bob);
-        assertEq(amount, fee(1.002 ether), "dave's fee is in the pot bob takes");
+        assertEq(amount, fee(1.001 ether), "dave's fee is not in what bob takes");
 
         vm.warp(opensAt + 1 days);
         buy(carol, 0.001 ether);
         vm.expectEmit(true, false, false, true);
-        emit HamsterNapHook.FailsafeTaken(bob, fee(1.003 ether), 649);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(1.001 ether), 649);
         vm.prank(carol);
         hook.failsafe();
-        assertEq(bob.balance, fee(1.003 ether));
+        assertEq(bob.balance, fee(1.001 ether));
         assertEq(dave.balance, 0);
         assertEq(carol.balance, 0);
+        assertEq(hook.pot(), fee(0.002 ether), "the late buys' fees wait in the pot");
+        assertBacked();
+
+        // Nothing more is payable until a late buy is seven days old.
+        vm.warp(opensAt + 7 days);
+        assertEq(hook.failsafeCutoff(), opensAt, "dave's buy at the opening is not yet before the cutoff");
+        vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+        hook.failsafe();
+        vm.warp(opensAt + 7 days + 1);
+        assertEq(hook.failsafeCutoff(), opensAt + 1);
+        (winner, amount) = hook.failsafeWinner();
+        assertEq(winner, dave);
+        assertEq(amount, fee(0.001 ether));
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(dave, fee(0.001 ether), 649);
+        hook.failsafe();
+        assertEq(dave.balance, fee(0.001 ether));
+        vm.warp(opensAt + 8 days + 1);
+        hook.failsafe();
+        assertEq(carol.balance, fee(0.001 ether));
+        assertEq(hook.pot(), 0);
+        assertBacked();
+    }
+
+    /// With a core that never returns, the failsafe's cutoff keeps rolling: a buyer who qualifies
+    /// after an earlier failsafe payout is paid the fees collected through their buy once it is seven
+    /// days old, and the earlier winner is never paid again.
+    function test_failsafePaysLaterQualifyingBuyersAsTheirBuysAge() public {
+        buy(alice, 1 ether);
+        core.setReverting(true); // dead from here on: the frontier and the opening never move
+        uint256 opensAt = hook.failsafeOpensAt();
+        vm.warp(opensAt);
+        hook.failsafe();
+        assertEq(alice.balance, fee(1 ether));
+        assertEq(hook.pot(), 0);
+
+        vm.warp(opensAt + 1 days);
+        buy(bob, 1 ether); // the last qualifying buyer, a day after the first payout
+        assertEq(hook.latestBuyer(), bob);
+        assertEq(hook.failsafeOpensAt(), opensAt, "the opening is frozen with the core");
+        assertEq(hook.failsafeCutoff(), opensAt, "the cutoff has not reached bob's buy yet");
+        (address winner, uint256 amount) = hook.failsafeWinner();
+        assertEq(winner, alice);
+        assertEq(amount, 0, "alice was paid through her last buy; bob's fee is not hers");
+        vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+        hook.failsafe();
+
+        vm.warp(opensAt + 8 days); // bob's buy is exactly seven days old: not yet before the cutoff
+        assertEq(hook.failsafeCutoff(), opensAt + 1 days);
+        vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+        hook.failsafe();
+
+        vm.warp(opensAt + 8 days + 1);
+        (winner, amount) = hook.failsafeWinner();
+        assertEq(winner, bob);
+        assertEq(amount, fee(1 ether));
+        vm.prank(carol); // anyone may trigger it
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(1 ether), 649);
+        hook.failsafe();
+        assertEq(bob.balance, fee(1 ether), "the last qualifying buyer takes the pot");
+        assertEq(alice.balance, fee(1 ether), "the first failsafe winner is not paid again");
+        assertEq(hook.pot(), 0);
+        assertBacked();
+    }
+
+    /// No qualifying buyer when the failsafe opened (dust only): the first buyer who qualifies later
+    /// is paid, the dust fees included, once their buy is seven days old, instead of nothing ever
+    /// leaving the hook.
+    function test_failsafeWithNoBuyerAtTheOpeningPaysTheFirstLaterQualifyingBuyer() public {
+        buy(alice, 0.0005 ether); // dust: a fee, no latest buyer
+        core.setReverting(true);
+        uint256 opensAt = hook.failsafeOpensAt();
+        vm.warp(opensAt + 1);
+        vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
+        hook.failsafe();
+        buy(bob, 1 ether); // the only qualifying buyer, after the opening
+        assertEq(hook.latestBuyer(), bob);
+        vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
+        hook.failsafe(); // bob's buy is not seven days old yet
+        vm.warp(opensAt + 7 days + 2);
+        vm.expectEmit(true, false, false, true);
+        emit HamsterNapHook.FailsafeTaken(bob, fee(1.0005 ether), 649);
+        hook.failsafe();
+        assertEq(bob.balance, fee(1.0005 ether), "the dust fee comes with it");
+        assertEq(hook.pot(), 0);
         assertBacked();
     }
 

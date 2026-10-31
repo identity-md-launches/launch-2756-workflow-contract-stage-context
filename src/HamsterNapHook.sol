@@ -77,7 +77,7 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
 
     /// @dev The state right after a buy, appended per buy in time order. Binary-searched at claim
     /// time for the last buy before a nap's first round, and at failsafe time for the last buy before
-    /// the failsafe opened.
+    /// the failsafe's cutoff.
     struct BuyRecord {
         uint64 round;
         uint64 time;
@@ -312,15 +312,20 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     }
 
     /// @notice If the core's settled frontier has stood still for 7 days, the pot goes to the last
-    /// qualifying buyer whose buy happened before the failsafe opened. Anyone may trigger it; only
-    /// that buyer is paid. Works when the core reverts, from the last frontier the hook saw. The 7
-    /// days count from the last time the hook saw the frontier advance (this call reads the core
-    /// first, so an advance it finds now restarts them), or from the frontier round's end if that is
-    /// later. Every nap the core certified before it stalled is settled first, to its own winner, so
-    /// the failsafe pays only what those naps leave; when more than `FAILSAFE_SCAN_PAGES` pages are
-    /// still unscanned it reverts with `NapsUnsettled` and `settleNaps` must catch up first. When the
-    /// core cannot be read at all, nothing can be certified and the whole pot goes to the failsafe's
-    /// winner.
+    /// qualifying buyer whose buy happened before the failsafe's cutoff (`failsafeCutoff()`: the
+    /// later of the failsafe's opening and seven days ago). Anyone may trigger it; only that buyer
+    /// is paid, and only the fees collected through the last buy before the cutoff: later fees stay
+    /// in the pot and become payable, to the buyer who was last when they were paid, once they are
+    /// themselves seven days old with the core still stale. So a buy placed in front of the
+    /// failsafe call never takes the pot, and with a core that never returns every fee still reaches
+    /// a buyer. Works when the core reverts, from the last frontier the hook saw. The 7 days count
+    /// from the last time the hook saw the frontier advance (this call reads the core first, so an
+    /// advance it finds now restarts them), or from the frontier round's end if that is later. Every
+    /// nap the core certified before it stalled is settled first, to its own winner, so the failsafe
+    /// pays only what those naps leave; when more than `FAILSAFE_SCAN_PAGES` pages are still
+    /// unscanned it reverts with `NapsUnsettled` and `settleNaps` must catch up first. When the core
+    /// cannot be read at all, nothing can be certified and the fees through the cutoff all go to the
+    /// failsafe's winner.
     function failsafe() external nonReentrant {
         if (scanRound == 0) revert GameNotStarted();
         (bool ok, uint64 frontier) = _readFrontier();
@@ -332,11 +337,11 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
             (, bool readable) = _scan(frontier, FAILSAFE_SCAN_PAGES);
             if (readable && scanRound <= frontier) revert NapsUnsettled(scanRound, frontier);
         }
-        (address winner,) = _stateBefore(staleAt, true);
+        (address winner, uint256 cumulative) = _stateBefore(_failsafeCutoff(staleAt), true);
         if (winner == address(0)) revert NoQualifyingBuyer();
-        uint256 amount = pot();
-        if (amount == 0) revert NothingToPay();
-        cumulativePaid += amount;
+        if (cumulative <= cumulativePaid) revert NothingToPay();
+        uint256 amount = cumulative - cumulativePaid;
+        cumulativePaid = cumulative;
         emit FailsafeTaken(winner, amount, frontier);
         _pay(winner, amount);
     }
@@ -433,13 +438,14 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         amount = cumulative - cumulativePaid;
     }
 
-    /// @notice Who the failsafe would pay if it opened at `failsafeOpensAt()` as known now (the last
-    /// qualifying buyer whose buy happened before that moment), and the pot it would take before any
-    /// certified nap still to be settled is paid out of it.
+    /// @notice Who the failsafe would pay if called now, as known now (the last qualifying buyer
+    /// whose buy happened before `failsafeCutoff()`), and the fees collected through that buy that
+    /// are not yet paid out, before any certified nap still to be settled is paid out of them.
     function failsafeWinner() external view returns (address winner, uint256 amount) {
-        (winner,) = _stateBefore(failsafeOpensAt(), true);
-        if (winner == address(0)) return (winner, 0);
-        amount = pot();
+        uint256 cumulative;
+        (winner, cumulative) = _stateBefore(_failsafeCutoff(failsafeOpensAt()), true);
+        if (winner == address(0) || cumulative <= cumulativePaid) return (winner, 0);
+        amount = cumulative - cumulativePaid;
     }
 
     /// @notice The earliest timestamp at which the failsafe opens, given what the hook has seen so
@@ -451,7 +457,24 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
         return since + FAILSAFE_DELAY;
     }
 
+    /// @notice The moment a buy must precede to count for the failsafe now: the later of
+    /// `failsafeOpensAt()` and `FAILSAFE_DELAY` ago. A buy made after the failsafe opened counts
+    /// once it is itself seven days old with the core still stale, never when it is placed in front
+    /// of the failsafe call.
+    function failsafeCutoff() external view returns (uint256) {
+        return _failsafeCutoff(failsafeOpensAt());
+    }
+
     // ---------------------------------------------------------------- internals
+
+    /// @dev The failsafe's cutoff for an opening at `staleAt`: that opening, or seven days ago when
+    /// that is later. The cutoff never stands still while the core does, so a buyer who qualifies
+    /// after the opening (or after an earlier failsafe payout) is paid once their buy is seven days
+    /// old, and nothing they paid stays locked.
+    function _failsafeCutoff(uint256 staleAt) private view returns (uint256) {
+        uint256 aged = block.timestamp > FAILSAFE_DELAY ? block.timestamp - FAILSAFE_DELAY : 0;
+        return aged > staleAt ? aged : staleAt;
+    }
 
     function _feeOnGross(uint256 gross) private pure returns (uint256) {
         return gross * FEE_BPS / BPS;
@@ -576,7 +599,7 @@ contract HamsterNapHook is BaseHook, IUnlockCallback {
     }
 
     /// @dev The state after the last recorded buy strictly before `bound`: a round (the first round
-    /// of a nap) when `byTime` is false, a timestamp (when the failsafe opened) when it is true.
+    /// of a nap) when `byTime` is false, a timestamp (the failsafe's cutoff) when it is true.
     /// Records are appended in time order, so both keys are non-decreasing along `_buys`.
     function _stateBefore(uint256 bound, bool byTime) private view returns (address winner, uint256 cumulative) {
         uint256 length = _buys.length;
