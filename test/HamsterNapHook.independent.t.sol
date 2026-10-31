@@ -92,7 +92,9 @@ contract HamsterNapHookIndependentTest is HookTestBase {
         warpToRound(681);
         bytes memory pageTwo = abi.encodeCall(ISqueekCore.roundPage, (665, 680, 16));
         vm.mockCallRevert(address(core), pageTwo, abi.encodeWithSelector(MockSqueekCore.Reverting.selector));
-        vm.expectRevert(MockSqueekCore.Reverting.selector);
+        // A later unreadable page reverts the whole claim, so the nap found on page one is not paid
+        // and the scan does not move past it.
+        vm.expectRevert(HamsterNapHook.CoreUnreadable.selector);
         hook.settleNaps(2);
         assertEq(hook.scanRound(), 650);
         assertEq(hook.zeroRun(), 0);
@@ -382,5 +384,70 @@ contract HamsterNapHookIndependentTest is HookTestBase {
         assertEq(hook.buyCount(), 1, "nothing recorded for a zero-fee dust buy");
         assertEq(hook.failsafeOpensAt(), block.timestamp + 7 days);
         assertEq(hook.latestBuyer(), alice);
+    }
+
+    /// @dev Page one of the backlog is readable and holds a certified nap; page two reverts. The failsafe
+    /// pays that nap to its own winner, then the rest of the pot to the failsafe winner, and a later
+    /// recovery of the core cannot pay either share again.
+    function test_failsafeOverPartlyReadableBacklogPaysCertifiedNapToItsWinner() public {
+        buy(alice, 1 ether);
+        core.setWork(650, 1);
+        core.setFrontier(680);
+        warpToRound(681);
+        buy(bob, 2 ether); // after the nap 651..653; observes frontier 680
+        bytes memory pageTwo = abi.encodeCall(ISqueekCore.roundPage, (665, 680, 16));
+        vm.mockCallRevert(address(core), pageTwo, abi.encodeWithSelector(MockSqueekCore.Reverting.selector));
+        uint256 opensAt = hook.failsafeOpensAt();
+        assertEq(opensAt, block.timestamp + 7 days);
+        vm.warp(opensAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        vm.warp(opensAt);
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit HamsterNapHook.NapSettled(651, alice, 0.02 ether);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit HamsterNapHook.FailsafeTaken(bob, 0.04 ether, 680);
+        vm.prank(carol);
+        hook.failsafe();
+        assertEq(alice.balance, 0.02 ether, "the certified nap's pot went to its own winner");
+        assertEq(bob.balance, 0.04 ether);
+        assertEq(hook.scanRound(), 666, "the scan stopped at the unreadable page");
+        assertEq(hook.pot(), 0);
+        vm.clearMockedCalls();
+        assertEq(hook.settleNaps(10), 0, "a zero run already counted is not a second nap");
+        assertEq(hook.scanRound(), 681);
+        assertEq(alice.balance + bob.balance, hook.cumulativeFees());
+        assertBacked();
+    }
+
+    /// @dev The failsafe winner is fixed at the second the failsafe opens: a qualifying buy one second
+    /// before it counts, a buy at that second or later pays into the pot and wins nothing from it.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_failsafeWinnerBoundary(uint32 earlySeed, uint32 lateSeed, uint96 lateEthSeed) public {
+        buy(alice, 1 ether);
+        core.setReverting(true); // dead core: the clock stays at the game's last sighting
+        uint256 opensAt = hook.failsafeOpensAt();
+        uint256 early = bound(earlySeed, 1, 7 days - 1);
+        uint256 late = bound(lateSeed, 0, 3 days);
+        uint256 lateEth = bound(lateEthSeed, 0.001 ether, 5 ether);
+        vm.warp(opensAt - early);
+        buy(bob, 0.001 ether);
+        vm.warp(opensAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        vm.warp(opensAt + late);
+        buy(dave, lateEth);
+        assertEq(hook.failsafeOpensAt(), opensAt, "a buy that reads nothing cannot move the clock");
+        uint256 expected = fee(1 ether) + fee(0.001 ether) + fee(lateEth);
+        (address winner, uint256 amount) = hook.failsafeWinner();
+        assertEq(winner, bob);
+        assertEq(amount, expected);
+        hook.failsafe();
+        assertEq(bob.balance, expected);
+        assertEq(dave.balance, 0);
+        assertEq(hook.pot(), 0);
+        vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+        hook.failsafe();
+        assertBacked();
     }
 }

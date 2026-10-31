@@ -87,6 +87,38 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         handler.takeFailsafeAfterSevenUnchangedDays();
         handler.checkModel();
     }
+
+    function test_handlerReachesFailsafeScanAndUnsettledBacklogRefusal() public {
+        // Rounds 650..658 certified with work only at 650: the nap 651..653 is certified but unscanned.
+        handler.buy(1 ether, 0, 2); // Alice, before the nap
+        vm.warp(block.timestamp + 7200);
+        handler.advanceAndCertify(0, 9, 1);
+        handler.buy(2 ether, 1, 2); // Bob, after the nap: observes the frontier, does not settle it
+        assertEq(hook.napsSettled(), 0);
+        handler.takeFailsafeAfterSevenUnchangedDays();
+        assertEq(handler.failsafes(), 1);
+        assertEq(handler.failsafeNaps(), 1, "the failsafe settled the certified nap first");
+        assertEq(hook.napsSettled(), 1);
+        assertEq(hook.scanRound(), 659);
+        assertGt(handler.actors(0).balance, 0, "Alice's nap was paid to Alice");
+        handler.checkModel();
+
+        // A backlog of more than eight pages refuses the failsafe until settleNaps catches up.
+        handler.buy(1 ether, 2, 2);
+        vm.warp(block.timestamp + 2 days);
+        for (uint256 i; i < 10; i++) {
+            handler.advanceAndCertify(0, 16, type(uint16).max); // 160 worked rounds
+        }
+        handler.buy(1 ether, 2, 2); // observe the frontier
+        handler.takeFailsafeAfterSevenUnchangedDays();
+        assertEq(handler.unsettledRefusals(), 1);
+        handler.settle(3);
+        handler.settle(3);
+        handler.settle(3);
+        handler.takeFailsafeAfterSevenUnchangedDays();
+        assertEq(handler.failsafes(), 2);
+        handler.checkModel();
+    }
 }
 
 /// @notice A separate campaign lets the ordinary one explore many timely naps, while this

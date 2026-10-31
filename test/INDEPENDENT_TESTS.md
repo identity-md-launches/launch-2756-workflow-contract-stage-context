@@ -5,9 +5,9 @@ configuration, dependencies, and ABI exports are unchanged.
 
 | File | Coverage |
 | --- | --- |
-| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core; price-limited partial fills (exact input and exact output) on both sides of the boundary second, their refunds to a rejecting sender wallet, a late backlog that restarts the failsafe clock, and sells that cannot move it. |
+| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core; price-limited partial fills (exact input and exact output) on both sides of the boundary second, their refunds to a rejecting sender wallet, a late backlog that restarts the failsafe clock, and sells that cannot move it; a failsafe over a partly readable backlog that pays the certified nap to its own winner first; 512 fuzz cases at the failsafe's opening second (a buy one second before counts, a buy at or after it wins nothing). |
 | `HamsterNapHook.fork.t.sol` | Five live-core tests at Sepolia block **12030457**, including every captured work record in rounds 483–642, configuration/frontier and invalid page bounds, three historical naps paid in order, and fresh token-only pool claim redemption. |
-| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. Two deterministic companions prove a deferred payout, withdrawal, failsafe, partial-fill refund and an unseen-advance `CoreNotStale` are reachable. |
+| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. Three deterministic companions prove a deferred payout, withdrawal, failsafe, partial-fill refund, an unseen-advance `CoreNotStale`, a failsafe that settles a certified nap first, and a `NapsUnsettled` refusal over a 160-round backlog are reachable. |
 | `independent/NapSequenceHandler.sol` | Random exact-input/output buys (full and price-limited partial fills) and sells, time advances, append-only certification, reverting/paused core, page-limited settlement, claim redemption, receiver rejection and withdrawals. |
 | `independent/SequenceCore.sol` | Efficient offline model of sparse settled-round pages. Only closed rounds can be certified, and certified work never changes. |
 
@@ -18,7 +18,12 @@ models partial exact-input fills from the router's actual debit (fee = 2% of the
 spent, the rest of the reservation owed back to `tx.origin`), and keeps its own record of when
 a hook call last read a higher frontier, so the failsafe is expected to open seven days after
 that sighting (or the sighted round's end) and to revert `CoreNotStale` while an advance is
-unseen. It checks the actual PoolManager ERC-6909 balance against `claimsHeld`, fee and refund
+unseen. For the failsafe it walks the certified backlog itself: more than eight pages (128 rounds)
+unscanned must revert `NapsUnsettled` with the exact scan position, otherwise every certified nap is
+paid to its own winner first (rolled back with the call if it then reverts `NothingToPay`), and the
+rest goes to the last qualifying buyer whose buy happened strictly before the failsafe opened. A
+reverting core skips the scan and the whole pot goes to that buyer. `settleNaps` on an unreadable
+core must revert `CoreUnreadable`. It checks the actual PoolManager ERC-6909 balance against `claimsHeld`, fee and refund
 conservation, the pot and debt backing, `lastSeenFrontier` / `frontierSeenAt`, scan progress,
 nap counts, and NAP supply/balances. The handler
 does not catch unexpected errors. A deterministic companion proves that a deferred
@@ -63,6 +68,18 @@ check the fixes rather than restating the findings:
    a frontier advance. Checked by `test_lateBacklogSeenByClaimRestartsFailsafeClock`,
    `test_onlyBuysAndClaimsMoveFailsafeClock` and the recovery campaign's observation-dated model.
 
+## Finding this round
+
+The implementation changed after the last round: the failsafe now settles certified naps first and
+pays the last qualifying buyer *before the failsafe opened*. The tests above cover that design. One
+consequence is reported in `.imd-findings.json` (medium) and is not asserted anywhere in this suite.
+With a dead core the opening moment never moves. So after one failsafe payout, every later fee goes
+to the same stale buyer, failsafe after failsafe. And if no qualifying buy came before the opening,
+`failsafe()` reverts `NoQualifyingBuyer` for ever, which locks every later fee. Both break rule 5
+("the last qualifying buyer can take the pot"). The finding carries a self-contained proof that fails
+on the current code. The invariant model only calls the failsafe at its opening moment, so it never
+hits this case.
+
 ## Remaining limits (not defects)
 
 - The hook cannot learn when the core really advanced, so the failsafe can open up to seven days
@@ -73,5 +90,4 @@ check the fixes rather than restating the findings:
 - If the core advances and then starts reverting before any hook call sees the advance, the hook
   dates the failsafe from its last successful sighting. This is the documented exit for a dead core.
 
-No new defect was found this round, so there is no `.imd-findings.json`. Passing tests do not
-imply launch readiness.
+Passing tests do not imply launch readiness.

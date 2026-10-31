@@ -17,6 +17,7 @@ contract NapSequenceHandler is Test {
 
     struct Purchase {
         uint64 round;
+        uint256 time;
         uint256 fee;
         address qualifyingBuyer;
     }
@@ -50,6 +51,8 @@ contract NapSequenceHandler is Test {
     uint256 public failsafes;
     uint256 public withdrawals;
     uint256 public partialFills;
+    uint256 public failsafeNaps;
+    uint256 public unsettledRefusals;
 
     constructor(HamsterNapHook h, SequenceCore c, Swapper r, PoolKey memory k) {
         hook = h;
@@ -142,26 +145,12 @@ contract NapSequenceHandler is Test {
             return;
         }
         if (core.unavailable()) {
-            vm.expectRevert(SequenceCore.Unavailable.selector);
+            vm.expectRevert(HamsterNapHook.CoreUnreadable.selector);
             hook.settleNaps(pages);
             return;
         }
         uint256 oldNaps = naps;
-        uint64 end = cursor + uint64(pages * 16) - 1;
-        if (end > core.frontier()) end = core.frontier();
-        while (cursor <= end) {
-            if (core.worked(cursor)) {
-                zeros = 0;
-            } else {
-                if (zeros == 0) napStart = cursor;
-                zeros++;
-                if (zeros == 3) {
-                    _allocateNap(napStart);
-                    naps++;
-                }
-            }
-            cursor++;
-        }
+        _scanThrough(cursor + uint64(pages * 16) - 1);
         assertEq(hook.settleNaps(pages), naps - oldNaps, "independent nap count");
         _observe();
         claims++;
@@ -199,19 +188,69 @@ contract NapSequenceHandler is Test {
         bool unseenAdvance = !core.unavailable() && core.frontier() > observedFrontier;
         if (cursor == 0) {
             vm.expectRevert(HamsterNapHook.GameNotStarted.selector);
-        } else if (unseenAdvance) {
+            hook.failsafe();
+            return;
+        }
+        if (unseenAdvance) {
             vm.expectRevert(
                 abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, vm.getBlockTimestamp() + 7 days)
             );
-        } else if (latest == address(0)) {
-            vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
-        } else if (fees == allocated) {
-            vm.expectRevert(HamsterNapHook.NothingToPay.selector);
-        } else {
-            awards[latest] += fees - allocated;
-            allocated = fees;
-            failsafes++;
+            hook.failsafe();
+            return;
         }
+        // A readable core: every certified nap is settled first, to its own winner, over at most eight
+        // pages; a longer backlog refuses the failsafe and leaves the scan untouched.
+        if (!core.unavailable() && cursor <= observedFrontier) {
+            if (observedFrontier - cursor + 1 > 8 * 16) {
+                vm.expectRevert(
+                    abi.encodeWithSelector(HamsterNapHook.NapsUnsettled.selector, cursor + 8 * 16, observedFrontier)
+                );
+                hook.failsafe();
+                unsettledRefusals++;
+                return;
+            }
+        }
+        // The winner is the last qualifying buyer whose buy happened strictly before the failsafe opened.
+        address winner;
+        for (uint256 i; i < history.length; i++) {
+            if (history[i].time >= at) break;
+            if (history[i].qualifyingBuyer != address(0)) winner = history[i].qualifyingBuyer;
+        }
+        if (winner == address(0)) {
+            vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
+            hook.failsafe();
+            return;
+        }
+        // The pre-payment scan's naps are part of the same call: if it then reverts, they roll back too.
+        uint256 napsBefore = naps;
+        uint256 allocatedBefore = allocated;
+        uint64 cursorBefore = cursor;
+        uint64 zerosBefore = zeros;
+        uint64 napStartBefore = napStart;
+        uint256 count = history.length;
+        uint256[] memory awardsBefore = new uint256[](actors.length);
+        for (uint256 i; i < actors.length; i++) {
+            awardsBefore[i] = awards[actors[i]];
+        }
+        if (!core.unavailable()) _scanThrough(observedFrontier);
+        if (fees == allocated) {
+            naps = napsBefore;
+            allocated = allocatedBefore;
+            cursor = cursorBefore;
+            zeros = zerosBefore;
+            napStart = napStartBefore;
+            for (uint256 i; i < actors.length; i++) {
+                awards[actors[i]] = awardsBefore[i];
+            }
+            assertEq(history.length, count);
+            vm.expectRevert(HamsterNapHook.NothingToPay.selector);
+            hook.failsafe();
+            return;
+        }
+        failsafeNaps += naps - napsBefore;
+        awards[winner] += fees - allocated;
+        allocated = fees;
+        failsafes++;
         hook.failsafe();
     }
 
@@ -243,6 +282,24 @@ contract NapSequenceHandler is Test {
         assertEq(hook.frontierSeenAt(), observedAt, "failsafe clock");
     }
 
+    /// @dev Walks certified rounds from the cursor through `end` (capped at the frontier), round by round.
+    function _scanThrough(uint64 end) private {
+        if (end > core.frontier()) end = core.frontier();
+        while (cursor <= end) {
+            if (core.worked(cursor)) {
+                zeros = 0;
+            } else {
+                if (zeros == 0) napStart = cursor;
+                zeros++;
+                if (zeros == 3) {
+                    _allocateNap(napStart);
+                    naps++;
+                }
+            }
+            cursor++;
+        }
+    }
+
     function _allocateNap(uint64 start) private {
         // A linear sum over actual trade history is deliberately different from the hook's
         // binary search over cumulative checkpoints.
@@ -265,7 +322,7 @@ contract NapSequenceHandler is Test {
         bool qualifies = gross >= 0.001 ether;
         if (qualifies) latest = actor;
         fees += paidFee;
-        history.push(Purchase(_round(), paidFee, qualifies ? actor : address(0)));
+        history.push(Purchase(_round(), vm.getBlockTimestamp(), paidFee, qualifies ? actor : address(0)));
         buys++;
         _observe(); // every buy reads the core
     }
