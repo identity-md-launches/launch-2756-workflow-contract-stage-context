@@ -21,7 +21,7 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         seedTokensOnly(1_000_000 ether);
         handler = new NapSequenceHandler(hook, sequenceCore, swapper, key);
         handler.buy(1 ether, 0, 2);
-        bytes4[] memory selectors = new bytes4[](_includeFailsafe() ? 9 : 8);
+        bytes4[] memory selectors = new bytes4[](_includeFailsafe() ? 10 : 9);
         selectors[0] = handler.buy.selector;
         selectors[1] = handler.sell.selector;
         selectors[2] = handler.advanceAndCertify.selector;
@@ -30,7 +30,8 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         selectors[5] = handler.redeem.selector;
         selectors[6] = handler.receiverStatus.selector;
         selectors[7] = handler.withdraw.selector;
-        if (_includeFailsafe()) selectors[8] = handler.takeFailsafeAfterSevenUnchangedDays.selector;
+        selectors[8] = handler.buyLimited.selector;
+        if (_includeFailsafe()) selectors[9] = handler.takeFailsafeAfterSevenUnchangedDays.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -66,6 +67,24 @@ contract HamsterNapHookInvariantTest is HookTestBase {
         handler.coreStatus(1);
         handler.takeFailsafeAfterSevenUnchangedDays();
         assertEq(handler.failsafes(), 1);
+        handler.checkModel();
+    }
+
+    function test_handlerReachesPartialRefundAndUnseenAdvanceKeepsFailsafeShut() public {
+        handler.buyLimited(10 ether, 1, 1, false); // 10 ETH offered, limit 1e-8 below the price
+        assertEq(handler.partialFills(), 1);
+        assertGt(hook.owed(handler.actors(1)), 0);
+        handler.withdraw(1);
+        handler.checkModel();
+        // Eight days pass, then the core certifies rounds that ended long ago, unseen by the hook.
+        vm.warp(block.timestamp + 8 days);
+        handler.advanceAndCertify(0, 16, 0);
+        uint256 failsBefore = handler.failsafes();
+        handler.takeFailsafeAfterSevenUnchangedDays(); // expects CoreNotStale(now + 7 days)
+        assertEq(handler.failsafes(), failsBefore);
+        handler.settle(1); // a claim call records the sighting
+        assertEq(hook.frontierSeenAt(), block.timestamp);
+        handler.takeFailsafeAfterSevenUnchangedDays();
         handler.checkModel();
     }
 }

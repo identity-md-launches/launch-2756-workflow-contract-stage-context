@@ -261,4 +261,126 @@ contract HamsterNapHookIndependentTest is HookTestBase {
         assertEq(hook.settleNaps(1), 0);
         assertBacked();
     }
+
+    // ------------------------------------------------ settled findings: partial fills and the failsafe clock
+
+    /// @dev Partial fills in the last second before the nap: exact-input and exact-output dust that
+    /// offered far more than 0.001 ETH cannot displace Alice; a real partial fill in the first second
+    /// of the nap qualifies but only for the next game.
+    function test_partialFillsAroundTheBoundaryFollowExecutedEth() public {
+        vm.warp(roundStart(651) - 1);
+        buy(alice, 1 ether);
+        uint160 price = currentSqrtPrice();
+        BalanceDelta carolDelta = buyWithLimit(carol, -int256(1 ether), price - price / 1e13);
+        uint256 carolPoolEth = uint256(uint128(-carolDelta.amount0())) - 0.02 ether;
+        uint256 carolFee = carolPoolEth * 200 / 9800;
+        assertLt(carolPoolEth + carolFee, 0.001 ether, "Carol's fill is dust");
+        assertGt(carolFee, 0);
+        assertEq(hook.owed(carol), 0.02 ether - carolFee);
+        price = currentSqrtPrice();
+        BalanceDelta daveDelta = buyWithLimit(dave, int256(1_000 ether), price - price / 1e13);
+        uint256 daveGross = uint256(uint128(-daveDelta.amount0()));
+        assertLt(daveGross, 0.001 ether, "Dave's exact-output fill is dust");
+        assertEq(hook.owed(dave), 0, "exact output reserves nothing");
+        assertEq(hook.latestBuyer(), alice);
+        uint256 firstPot = 0.02 ether + carolFee + daveGross / 50;
+        assertEq(hook.cumulativeFees(), firstPot);
+
+        warpToRound(651);
+        price = currentSqrtPrice();
+        BalanceDelta bobDelta = buyWithLimit(bob, -int256(10 ether), price - price / 1e6);
+        uint256 bobPoolEth = uint256(uint128(-bobDelta.amount0())) - 0.2 ether;
+        uint256 bobFee = bobPoolEth * 200 / 9800;
+        assertLt(bobPoolEth + bobFee, 10 ether, "partial");
+        assertGe(bobPoolEth + bobFee, 0.001 ether, "but large enough to qualify");
+        assertEq(hook.latestBuyer(), bob);
+        assertEq(hook.owed(bob), 0.2 ether - bobFee);
+
+        core.setWork(650, 1);
+        core.setFrontier(653);
+        warpToRound(654);
+        assertEq(hook.settleNaps(1), 1);
+        assertEq(alice.balance, firstPot, "fees before round 651 only");
+        assertEq(hook.pot(), bobFee, "Bob's fee waits for the next game");
+        assertEq(hook.totalOwed(), 0.02 ether - carolFee + 0.2 ether - bobFee, "refunds are not pot");
+        assertBacked();
+        vm.prank(carol);
+        hook.withdrawOwed();
+        vm.prank(bob);
+        hook.withdrawOwed();
+        assertEq(carol.balance + bob.balance, 0.22 ether - carolFee - bobFee);
+        assertEq(hook.totalOwed(), 0);
+        assertBacked();
+    }
+
+    /// @dev A sender wallet with code that rejects ETH keeps its refund as a debt and blocks nobody.
+    function test_partialRefundToRejectingOriginIsHeldAndDoesNotBlockNap() public {
+        RejectingWinner origin = new RejectingWinner();
+        buy(alice, 1 ether);
+        uint160 price = currentSqrtPrice();
+        buyWithLimit(address(origin), -int256(1 ether), price - price / 1e13);
+        uint256 refund = hook.owed(address(origin));
+        assertGt(refund, 0.019 ether);
+        assertEq(hook.latestBuyer(), alice);
+        vm.expectRevert(HamsterNapHook.TransferFailed.selector);
+        origin.withdrawFrom(address(hook));
+        core.setWork(650, 1);
+        core.setFrontier(653);
+        warpToRound(654);
+        uint256 pot = hook.pot();
+        assertEq(hook.settleNaps(1), 1);
+        assertEq(alice.balance, pot);
+        assertEq(hook.owed(address(origin)), refund, "the nap payout cannot spend a refund");
+        assertBacked();
+        origin.setAccepting(true);
+        origin.withdrawFrom(address(hook));
+        assertEq(address(origin).balance, refund);
+        assertBacked();
+    }
+
+    /// @dev Settlement lag: a backlog of old rounds certified eight days late is a fresh advance.
+    /// A claim call records the sighting; the failsafe opens exactly seven unchanged days later.
+    function test_lateBacklogSeenByClaimRestartsFailsafeClock() public {
+        buy(alice, 1 ether);
+        uint256 firstOpen = hook.failsafeOpensAt();
+        assertEq(firstOpen, block.timestamp + 7 days);
+        vm.warp(block.timestamp + 8 days);
+        core.setWork(650, 1);
+        core.setWork(652, 1);
+        core.setFrontier(660);
+        assertEq(hook.settleNaps(1), 1, "nap 653..655 found in the backlog");
+        assertEq(alice.balance, 0.02 ether);
+        buy(bob, 2 ether);
+        uint256 opensAt = block.timestamp + 7 days;
+        assertEq(hook.frontierSeenAt(), block.timestamp);
+        assertEq(hook.failsafeOpensAt(), opensAt);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        // The core stalls and starts reverting: the last sighting still dates the failsafe.
+        core.setReverting(true);
+        vm.warp(opensAt - 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, opensAt));
+        hook.failsafe();
+        vm.warp(opensAt);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit HamsterNapHook.FailsafeTaken(bob, 0.04 ether, 660);
+        hook.failsafe();
+        assertEq(bob.balance, 0.04 ether);
+        assertEq(alice.balance, 0.02 ether, "the settled nap is not paid again");
+        assertBacked();
+    }
+
+    /// @dev A sell observes nothing, so it cannot keep the failsafe shut; a dust buy does.
+    function test_onlyBuysAndClaimsMoveFailsafeClock() public {
+        buy(alice, 1 ether);
+        uint256 opensAt = hook.failsafeOpensAt();
+        vm.warp(opensAt - 1 days);
+        core.setFrontier(650);
+        sell(carol, 1 ether);
+        assertEq(hook.failsafeOpensAt(), opensAt, "a sell never reads the core");
+        buy(dave, 49); // zero fee, not qualifying, but it does read the core
+        assertEq(hook.buyCount(), 1, "nothing recorded for a zero-fee dust buy");
+        assertEq(hook.failsafeOpensAt(), block.timestamp + 7 days);
+        assertEq(hook.latestBuyer(), alice);
+    }
 }

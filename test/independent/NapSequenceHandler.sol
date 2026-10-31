@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {HamsterNapHook} from "src/HamsterNapHook.sol";
 import {Swapper} from "../mocks/Swapper.sol";
 import {RejectingWinner} from "../mocks/RejectingWinner.sol";
@@ -11,6 +13,8 @@ import {SequenceCore} from "./SequenceCore.sol";
 
 /// @dev Independent linear history model. It never derives expected fees or awards from hook counters.
 contract NapSequenceHandler is Test {
+    using PoolIdLibrary for PoolKey;
+
     struct Purchase {
         uint64 round;
         uint256 fee;
@@ -28,17 +32,24 @@ contract NapSequenceHandler is Test {
     uint256 public fees;
     uint256 public allocated;
     mapping(address => uint256) public awards;
+    /// @dev Unused exact-input fee reservations of partial fills, owed back to the buyer.
+    mapping(address => uint256) public refunds;
+    uint256 public totalRefunds;
     address public latest;
     uint64 public cursor;
     uint64 public zeros;
     uint64 public napStart;
     uint256 public naps;
-    uint256 public lastAdvanceTime;
+    /// @dev The highest frontier a successful hook call has read, and when. The hook cannot know
+    /// when the core really advanced, so the failsafe's seven days run from the hook's sighting.
+    uint64 public observedFrontier;
+    uint256 public observedAt;
     uint256 public buys;
     uint256 public sells;
     uint256 public claims;
     uint256 public failsafes;
     uint256 public withdrawals;
+    uint256 public partialFills;
 
     constructor(HamsterNapHook h, SequenceCore c, Swapper r, PoolKey memory k) {
         hook = h;
@@ -47,7 +58,6 @@ contract NapSequenceHandler is Test {
         key = k;
         rejecting = new RejectingWinner();
         actors = [makeAddr("sequence.alice"), makeAddr("sequence.bob"), makeAddr("sequence.carol"), address(rejecting)];
-        lastAdvanceTime = vm.getBlockTimestamp();
     }
 
     function buy(uint256 amountSeed, uint8 actorSeed, uint8 kind) external {
@@ -61,12 +71,43 @@ contract NapSequenceHandler is Test {
         if (kind % 2 == 0) assertEq(gross, amount, "this campaign has enough liquidity for full fills");
         else assertEq(uint256(uint128(delta.amount1())), amount);
         _start();
-        bool qualifies = gross >= 0.001 ether;
-        if (qualifies) latest = actor;
-        uint256 paidFee = gross / 50;
-        fees += paidFee;
-        history.push(Purchase(_round(), paidFee, qualifies ? actor : address(0)));
-        buys++;
+        _record(actor, gross, gross / 50);
+    }
+
+    /// @notice A buy bounded by a sqrt price 1e-12 to 1e-6 below the current one, so the pool often fills
+    /// only part of it. The fee and the 0.001 ETH threshold must follow the ETH really spent.
+    function buyLimited(uint256 amountSeed, uint8 actorSeed, uint32 limitSeed, bool exactOutput) external {
+        address actor = actors[actorSeed % 4];
+        uint256 amount = bound(amountSeed, 50, exactOutput ? 1000 ether : 10 ether);
+        (uint160 price,,,) = StateLibrary.getSlot0(router.manager(), key.toId());
+        uint160 limit = uint160(uint256(price) - uint256(price) * bound(limitSeed, 1, 1e6) / 1e12);
+        uint256 owedBefore = hook.owed(actor);
+        vm.prank(actor, actor);
+        BalanceDelta delta = router.swapWithLimit(key, true, exactOutput ? int256(amount) : -int256(amount), limit);
+        uint256 debit = uint256(uint128(-delta.amount0()));
+        _start();
+        if (exactOutput) {
+            assertLe(uint256(uint128(delta.amount1())), amount);
+            // The buyer pays the pool's ETH plus 2% of the total: debit / 50 is exactly the fee.
+            _record(actor, debit, debit / 50);
+        } else {
+            assertLe(debit, amount, "never charged above the offered input");
+            uint256 reserved = amount / 50;
+            if (debit == amount) {
+                _record(actor, amount, reserved);
+            } else {
+                // The router settled the pool's fill plus the whole reservation.
+                uint256 poolEth = debit - reserved;
+                uint256 due = poolEth * 200 / 9800;
+                if (due > reserved) due = reserved;
+                uint256 refund = reserved - due;
+                assertEq(hook.owed(actor), owedBefore + refund, "unused reservation credited to the buyer");
+                refunds[actor] += refund;
+                totalRefunds += refund;
+                _record(actor, poolEth + due, due);
+                partialFills++;
+            }
+        }
     }
 
     function sell(uint96 amountSeed, uint8 actorSeed, bool exactOutput) external {
@@ -78,6 +119,7 @@ contract NapSequenceHandler is Test {
         assertGt(delta.amount0(), 0);
         _start();
         sells++;
+        // Sells never read the core, so they never move the failsafe's clock.
     }
 
     function advanceAndCertify(uint16 secondsSeed, uint8 countSeed, uint16 workBits) external {
@@ -85,10 +127,7 @@ contract NapSequenceHandler is Test {
         uint64 available = _round() - 1 - core.frontier();
         if (available > 16) available = 16;
         uint64 count = uint64(bound(countSeed, 0, available));
-        if (count > 0) {
-            core.certify(count, workBits);
-            lastAdvanceTime = vm.getBlockTimestamp();
-        }
+        if (count > 0) core.certify(count, workBits);
     }
 
     function coreStatus(uint8 status) external {
@@ -124,6 +163,7 @@ contract NapSequenceHandler is Test {
             cursor++;
         }
         assertEq(hook.settleNaps(pages), naps - oldNaps, "independent nap count");
+        _observe();
         claims++;
     }
 
@@ -150,12 +190,19 @@ contract NapSequenceHandler is Test {
     }
 
     function takeFailsafeAfterSevenUnchangedDays() external {
-        // This exercises a valid stale interval. Premature release after a recent old-round
-        // certification is a separate failing proof in the findings, not a blessed property.
-        uint256 at = lastAdvanceTime + 7 days;
+        // Seven days after the later of the last sighting and the sighted round's end. An advance
+        // the hook has not seen yet must keep the failsafe shut, however old the advanced round is.
+        uint256 since = 1793022600 + uint256(observedFrontier) * 600;
+        if (observedAt > since) since = observedAt;
+        uint256 at = since + 7 days;
         if (at > vm.getBlockTimestamp()) vm.warp(at);
+        bool unseenAdvance = !core.unavailable() && core.frontier() > observedFrontier;
         if (cursor == 0) {
             vm.expectRevert(HamsterNapHook.GameNotStarted.selector);
+        } else if (unseenAdvance) {
+            vm.expectRevert(
+                abi.encodeWithSelector(HamsterNapHook.CoreNotStale.selector, vm.getBlockTimestamp() + 7 days)
+            );
         } else if (latest == address(0)) {
             vm.expectRevert(HamsterNapHook.NoQualifyingBuyer.selector);
         } else if (fees == allocated) {
@@ -181,13 +228,19 @@ contract NapSequenceHandler is Test {
         uint256 paid;
         for (uint256 i; i < actors.length; i++) {
             uint256 debt = hook.owed(actors[i]);
-            assertEq(actors[i].balance + debt, awards[actors[i]], "wrong winner or duplicate payment");
+            assertEq(
+                actors[i].balance + debt, awards[actors[i]] + refunds[actors[i]], "wrong winner or duplicate payment"
+            );
             totalDebt += debt;
             paid += actors[i].balance;
         }
         assertEq(hook.totalOwed(), totalDebt);
-        assertEq(paid + totalDebt, allocated);
-        assertEq(address(hook).balance + hook.claimsHeld() + paid, fees, "every fee wei is accounted for");
+        assertEq(paid + totalDebt, allocated + totalRefunds);
+        assertEq(
+            address(hook).balance + hook.claimsHeld() + paid, fees + totalRefunds, "every fee wei is accounted for"
+        );
+        assertEq(hook.lastSeenFrontier(), observedFrontier, "frontier sightings");
+        assertEq(hook.frontierSeenAt(), observedAt, "failsafe clock");
     }
 
     function _allocateNap(uint64 start) private {
@@ -207,8 +260,28 @@ contract NapSequenceHandler is Test {
         }
     }
 
+    /// @dev A buy as the hook should see it: `gross` ETH really spent, `paidFee` of it to the pot.
+    function _record(address actor, uint256 gross, uint256 paidFee) private {
+        bool qualifies = gross >= 0.001 ether;
+        if (qualifies) latest = actor;
+        fees += paidFee;
+        history.push(Purchase(_round(), paidFee, qualifies ? actor : address(0)));
+        buys++;
+        _observe(); // every buy reads the core
+    }
+
     function _start() private {
-        if (cursor == 0) cursor = _round();
+        if (cursor == 0) {
+            cursor = _round();
+            observedAt = vm.getBlockTimestamp();
+        }
+    }
+
+    function _observe() private {
+        if (!core.unavailable() && core.frontier() > observedFrontier) {
+            observedFrontier = core.frontier();
+            observedAt = vm.getBlockTimestamp();
+        }
     }
 
     function _round() private view returns (uint64) {

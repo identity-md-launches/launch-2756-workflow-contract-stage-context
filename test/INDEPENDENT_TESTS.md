@@ -5,17 +5,22 @@ configuration, dependencies, and ABI exports are unchanged.
 
 | File | Coverage |
 | --- | --- |
-| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core. |
+| `HamsterNapHook.independent.t.sol` | 1,000 fuzz cases at the last-second/first-second boundary; dust before and during a nap; delayed third-round certification; interrupted zero runs; multiple naps spanning page boundaries; atomic rollback after a later page reverts; accumulating rejected payouts, failed and repeated withdrawals; failsafe/deferred-debt isolation and recovery; malformed core responses; exact-input/output sells and LP fee collection with an unavailable core; price-limited partial fills (exact input and exact output) on both sides of the boundary second, their refunds to a rejecting sender wallet, a late backlog that restarts the failsafe clock, and sells that cannot move it. |
 | `HamsterNapHook.fork.t.sol` | Five live-core tests at Sepolia block **12030457**, including every captured work record in rounds 483–642, configuration/frontier and invalid page bounds, three historical naps paid in order, and fresh token-only pool claim redemption. |
-| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. |
-| `independent/NapSequenceHandler.sol` | Random exact-input/output buys and sells, time advances, append-only certification, reverting/paused core, page-limited settlement, claim redemption, receiver rejection and withdrawals. |
+| `HamsterNapHook.invariant.t.sol` | Two campaigns, each **256 runs × 96 calls**, with unexpected handler reverts treated as failures. One explores ordinary settlement and one also introduces seven-day outages and failsafes. Two deterministic companions prove a deferred payout, withdrawal, failsafe, partial-fill refund and an unseen-advance `CoreNotStale` are reachable. |
+| `independent/NapSequenceHandler.sol` | Random exact-input/output buys (full and price-limited partial fills) and sells, time advances, append-only certification, reverting/paused core, page-limited settlement, claim redemption, receiver rejection and withdrawals. |
 | `independent/SequenceCore.sol` | Efficient offline model of sparse settled-round pages. Only closed rounds can be certified, and certified work never changes. |
 
 The invariant oracle keeps its own linear trade history. It computes fees from actual
 ETH debits, determines winners and eligible fees independently of the hook's cumulative
 checkpoints, and compares awards to each receiver's ETH plus deferred debt. It also
-checks the actual PoolManager ERC-6909 balance against `claimsHeld`, fee conservation,
-the pot and debt backing, scan progress, nap counts, and NAP supply/balances. The handler
+models partial exact-input fills from the router's actual debit (fee = 2% of the ETH really
+spent, the rest of the reservation owed back to `tx.origin`), and keeps its own record of when
+a hook call last read a higher frontier, so the failsafe is expected to open seven days after
+that sighting (or the sighted round's end) and to revert `CoreNotStale` while an advance is
+unseen. It checks the actual PoolManager ERC-6909 balance against `claimsHeld`, fee and refund
+conservation, the pot and debt backing, `lastSeenFrontier` / `frontierSeenAt`, scan progress,
+nap counts, and NAP supply/balances. The handler
 does not catch unexpected errors. A deterministic companion proves that a deferred
 payout, successful withdrawal, and failsafe are reachable.
 
@@ -43,20 +48,30 @@ FOUNDRY_FUZZ_SEED=0xfbaf61498d090e9328f47570cd503c9b9f7a6967092682129c4f05d58ca2
 FOUNDRY_FUZZ_SEED=0xfbaf61498d090e9328f47570cd503c9b9f7a6967092682129c4f05d58ca2d30c forge test
 ```
 
-## Reported defects and limits
+## Findings from the previous round, settled
 
-Two high-severity findings are reported in the assignment's `.imd-findings.json`,
-with complete standalone offline Foundry proofs that were run and failed for the
-stated reasons:
+Both high-severity findings reported last round are fixed in the current tree, and these tests
+check the fixes rather than restating the findings:
 
-1. A partial exact-input fill uses the requested maximum for the fee and qualifying
-   threshold. A buy spending **21,012,659,207,850 wei**, below the **10^15 wei** minimum,
-   can win a **20,020,000,000,000,000 wei** pot. The ordinary invariant campaign uses
-   fully filled trades; it does not claim that partial fills are correct.
-2. The failsafe dates staleness from the certified round's end, so an advancement
-   observed now can still permit an immediate payout if that round is old. The
-   campaign tests valid seven-day unchanged intervals. The accepted suite's
-   round-end-based failsafe expectations do not establish the workflow requirement.
+1. **Partial exact-input dust fills.** The fee and the 0.001 ETH threshold now follow the pool's
+   fill; the unused reservation is credited to the buyer. Checked by
+   `test_partialFillsAroundTheBoundaryFollowExecutedEth` (a dust fill offering 1 ETH in the last
+   second before round 651 cannot displace Alice, who receives exactly the fees before 651),
+   `test_partialRefundToRejectingOriginIsHeldAndDoesNotBlockNap`, and the `buyLimited` handler
+   action in both invariant campaigns.
+2. **Failsafe dated from the round end.** The failsafe now counts from the hook's last sighting of
+   a frontier advance. Checked by `test_lateBacklogSeenByClaimRestartsFailsafeClock`,
+   `test_onlyBuysAndClaimsMoveFailsafeClock` and the recovery campaign's observation-dated model.
 
-Failing proofs are embedded in the findings rather than committed as failing test
-entry points. Passing tests do not resolve these defects or imply launch readiness.
+## Remaining limits (not defects)
+
+- The hook cannot learn when the core really advanced, so the failsafe can open up to seven days
+  late, never early. An advance that only the `failsafe()` call itself finds reverts with
+  `CoreNotStale`, and that revert also undoes the sighting. So the failsafe stays shut until a buy
+  (dust is enough) or a `settleNaps` call records it. That is the conservative direction, and a
+  way out always exists, because buys read the core even when `roundPage` does not work.
+- If the core advances and then starts reverting before any hook call sees the advance, the hook
+  dates the failsafe from its last successful sighting. This is the documented exit for a dead core.
+
+No new defect was found this round, so there is no `.imd-findings.json`. Passing tests do not
+imply launch readiness.
